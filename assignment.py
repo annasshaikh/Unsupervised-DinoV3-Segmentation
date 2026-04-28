@@ -1,0 +1,419 @@
+"""
+assignment.py – Mapping cluster IDs to semantic class labels.
+
+All methods inherit from :class:`Assignment` and implement::
+
+    assign(cluster_labels, gt_mask) -> mapping : dict {cluster_id: class_id}
+
+Registered methods
+------------------
+A-1  majority_vote      – Majority-vote per cluster
+A-2  weighted_majority  – Weighted majority vote (soft distance weighting)
+A-3  hungarian          – Hungarian matching via IoU cost matrix
+A-4  label_propagation  – Soft assignment with label propagation
+A-5  abstention         – Majority vote + abstain if confidence < threshold
+A-6  cross_image        – Per-image assignment + cross-image consistency metric
+"""
+
+from __future__ import annotations
+
+from abc import ABC, abstractmethod
+from typing import Any, Dict, Optional, Tuple
+
+import numpy as np
+import torch
+from torch import Tensor
+
+
+# ── Registry ─────────────────────────────────────────────────────────────────
+
+_REGISTRY: Dict[str, type] = {}
+
+
+def _register(name: str):
+    def decorator(cls):
+        _REGISTRY[name] = cls
+        return cls
+    return decorator
+
+
+def get_assignment_method(name: str, **kwargs) -> "Assignment":
+    if name not in _REGISTRY:
+        raise KeyError(
+            f"Unknown assignment method {name!r}. Available: {list(_REGISTRY)}"
+        )
+    return _REGISTRY[name](**kwargs)
+
+
+# ── Base class ────────────────────────────────────────────────────────────────
+
+class Assignment(ABC):
+    """
+    Abstract base class for cluster-to-class assignment.
+
+    The ``ignore_index`` class is treated as unlabelled ground-truth.
+    """
+
+    IGNORE_INDEX: int = 255
+
+    @abstractmethod
+    def assign(
+        self,
+        cluster_labels: Tensor,
+        gt_mask: Tensor,
+    ) -> Dict[int, int]:
+        """
+        Compute a cluster → class mapping for a single image.
+
+        Parameters
+        ----------
+        cluster_labels : Tensor (N,) or (H, W)
+            Integer cluster indices.
+        gt_mask : Tensor (H, W)
+            Ground-truth class labels (binary 0/1 or multi-class).
+            Pixels == ``IGNORE_INDEX`` are excluded.
+
+        Returns
+        -------
+        mapping : dict {cluster_id: class_id}
+        """
+
+    def apply(
+        self,
+        cluster_labels: Tensor,
+        gt_mask: Tensor,
+    ) -> Tensor:
+        """
+        Convenience: apply the mapping to produce a predicted mask Tensor (H, W).
+        """
+        H, W     = gt_mask.shape
+        flat_cl  = cluster_labels.reshape(-1).long()
+        mapping  = self.assign(flat_cl, gt_mask)
+        pred     = torch.full((flat_cl.numel(),), self.IGNORE_INDEX, dtype=torch.long)
+        for c_id, cls in mapping.items():
+            pred[flat_cl == c_id] = cls
+        return pred.reshape(H, W)
+
+    # ── helpers ──────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _flatten_both(
+        cluster_labels: Tensor,
+        gt_mask: Tensor,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Return (flat cluster ids, flat gt labels) arrays with ignore removed."""
+        flat_cl  = cluster_labels.reshape(-1).cpu().numpy().astype(int)
+        flat_gt  = gt_mask.reshape(-1).cpu().numpy().astype(int)
+        valid    = flat_gt != Assignment.IGNORE_INDEX
+        return flat_cl[valid], flat_gt[valid]
+
+
+# ── A-1: Majority vote ────────────────────────────────────────────────────────
+
+@_register("majority_vote")
+class MajorityVote(Assignment):
+    """A-1: Each cluster takes the most frequent GT label among its pixels."""
+
+    def assign(
+        self,
+        cluster_labels: Tensor,
+        gt_mask: Tensor,
+        **kwargs: Any,
+    ) -> Dict[int, int]:
+        cl, gt = self._flatten_both(cluster_labels, gt_mask)
+        mapping: Dict[int, int] = {}
+        for c in np.unique(cl):
+            mask_c   = cl == c
+            gt_c     = gt[mask_c]
+            if gt_c.size == 0:
+                mapping[int(c)] = 0
+                continue
+            vals, cnts = np.unique(gt_c, return_counts=True)
+            mapping[int(c)] = int(vals[cnts.argmax()])
+        return mapping
+
+
+# ── A-2: Weighted majority vote ───────────────────────────────────────────────
+
+@_register("weighted_majority")
+class WeightedMajorityVote(Assignment):
+    """
+    A-2: Majority vote weighted by inverse distance to cluster centroid.
+
+    If embeddings are not supplied the method degenerates to plain majority
+    vote.
+
+    Parameters
+    ----------
+    embeddings : Tensor (N, D) or None
+        Feature embeddings aligned with ``cluster_labels``.
+    """
+
+    def __init__(self, embeddings: Optional[Tensor] = None) -> None:
+        self.embeddings = embeddings
+
+    def assign(
+        self,
+        cluster_labels: Tensor,
+        gt_mask: Tensor,
+        embeddings: Optional[Tensor] = None,
+        **kwargs: Any,
+    ) -> Dict[int, int]:
+        emb = embeddings if embeddings is not None else self.embeddings
+
+        cl, gt = self._flatten_both(cluster_labels, gt_mask)
+        mapping: Dict[int, int] = {}
+
+        for c in np.unique(cl):
+            mask_c = cl == c
+            gt_c   = gt[mask_c]
+            if gt_c.size == 0:
+                mapping[int(c)] = 0
+                continue
+
+            if emb is not None:
+                flat_emb  = emb.reshape(-1, emb.shape[-1]).cpu().float()
+                all_flat  = cluster_labels.reshape(-1).cpu().numpy().astype(int)
+                valid_idx = np.where(gt_mask.reshape(-1).cpu().numpy() != self.IGNORE_INDEX)[0]
+                emb_valid = flat_emb[valid_idx]
+                emb_c     = emb_valid[mask_c]
+                centroid  = emb_c.mean(dim=0, keepdim=True)              # (1, D)
+                dists     = torch.norm(emb_c - centroid, dim=1)          # (N_c,)
+                weights   = 1.0 / (dists.numpy() + 1e-6)
+            else:
+                weights = np.ones(gt_c.size)
+
+            classes      = np.unique(gt_c)
+            class_scores = {int(cls): weights[gt_c == cls].sum() for cls in classes}
+            mapping[int(c)] = max(class_scores, key=class_scores.get)
+
+        return mapping
+
+
+# ── A-3: Hungarian matching ───────────────────────────────────────────────────
+
+@_register("hungarian")
+class HungarianMatching(Assignment):
+    """
+    A-3: Build an IoU cost matrix between clusters and GT classes,
+    then solve with the Hungarian algorithm.
+    """
+
+    def assign(
+        self,
+        cluster_labels: Tensor,
+        gt_mask: Tensor,
+        **kwargs: Any,
+    ) -> Dict[int, int]:
+        from scipy.optimize import linear_sum_assignment
+
+        cl, gt = self._flatten_both(cluster_labels, gt_mask)
+
+        cluster_ids = np.unique(cl)
+        class_ids   = np.unique(gt)
+        K           = len(cluster_ids)
+        C           = len(class_ids)
+
+        # Build IoU matrix (K, C)
+        iou_mat = np.zeros((K, C), dtype=np.float64)
+        for i, c_id in enumerate(cluster_ids):
+            pred_c = cl == c_id
+            for j, cls in enumerate(class_ids):
+                gt_c  = gt == cls
+                inter = (pred_c & gt_c).sum()
+                union = (pred_c | gt_c).sum()
+                iou_mat[i, j] = inter / (union + 1e-6)
+
+        # Minimise negative IoU
+        row_ind, col_ind = linear_sum_assignment(-iou_mat)
+        mapping: Dict[int, int] = {}
+        for r, c in zip(row_ind, col_ind):
+            mapping[int(cluster_ids[r])] = int(class_ids[c])
+
+        # Unmatched clusters → majority vote fallback
+        matched_clusters = set(row_ind)
+        mv = MajorityVote()
+        fallback = mv.assign(cluster_labels, gt_mask)
+        for i, c_id in enumerate(cluster_ids):
+            if i not in matched_clusters:
+                mapping[int(c_id)] = fallback.get(int(c_id), 0)
+
+        return mapping
+
+
+# ── A-4: Soft label propagation ───────────────────────────────────────────────
+
+@_register("label_propagation")
+class LabelPropagation(Assignment):
+    """
+    A-4: Build a soft assignment via label propagation on a K-NN graph in
+    embedding space.  Returns a hard mapping after propagation.
+
+    Parameters
+    ----------
+    k : int
+        Number of neighbours.
+    alpha : float
+        Propagation dampening factor (0 < α < 1).
+    n_iter : int
+        Number of propagation iterations.
+    """
+
+    def __init__(self, k: int = 10, alpha: float = 0.8, n_iter: int = 20) -> None:
+        self.k      = k
+        self.alpha  = alpha
+        self.n_iter = n_iter
+
+    def assign(
+        self,
+        cluster_labels: Tensor,
+        gt_mask: Tensor,
+        embeddings: Optional[Tensor] = None,
+        **kwargs: Any,
+    ) -> Dict[int, int]:
+        # Fallback to majority vote if no embeddings
+        if embeddings is None:
+            return MajorityVote().assign(cluster_labels, gt_mask)
+
+        cl, gt = self._flatten_both(cluster_labels, gt_mask)
+        flat_emb = embeddings.reshape(-1, embeddings.shape[-1])
+        flat_gt_full = gt_mask.reshape(-1).cpu().numpy().astype(int)
+        valid_mask   = flat_gt_full != self.IGNORE_INDEX
+
+        X   = flat_emb.cpu().float().numpy()
+        N   = X.shape[0]
+
+        classes     = np.unique(gt)
+        C           = len(classes)
+        class_map   = {cls: i for i, cls in enumerate(classes)}
+
+        # Initialise label matrix
+        F = np.zeros((N, C), dtype=np.float32)
+        for i, cls in enumerate(classes):
+            F[valid_mask & (flat_gt_full == cls), i] = 1.0
+
+        Y = F.copy()  # clamped labels
+
+        # Build sparse K-NN affinity (cosine)
+        from sklearn.neighbors import kneighbors_graph
+        A = kneighbors_graph(X, n_neighbors=min(self.k, N - 1),
+                             mode="connectivity", include_self=False)
+        # Symmetrise and row-normalise
+        A = (A + A.T)
+        A.data = np.ones_like(A.data)
+        deg   = np.asarray(A.sum(axis=1)).flatten()
+        Dinv  = np.diag(1.0 / (deg + 1e-6))
+        W     = Dinv @ A.toarray()
+
+        for _ in range(self.n_iter):
+            F = self.alpha * W @ F + (1.0 - self.alpha) * Y
+
+        predicted = F.argmax(axis=1)
+
+        # Build cluster → class mapping via majority
+        cluster_ids = np.unique(cl)
+        flat_cl_all = cluster_labels.reshape(-1).cpu().numpy().astype(int)
+        mapping: Dict[int, int] = {}
+        for c_id in cluster_ids:
+            pixels   = np.where(flat_cl_all == c_id)[0]
+            preds_c  = predicted[pixels]
+            if preds_c.size == 0:
+                mapping[int(c_id)] = int(classes[0])
+                continue
+            vals, cnts = np.unique(preds_c, return_counts=True)
+            best_idx   = int(vals[cnts.argmax()])
+            mapping[int(c_id)] = int(classes[best_idx]) if best_idx < len(classes) else int(classes[0])
+
+        return mapping
+
+
+# ── A-5: Abstention with threshold ────────────────────────────────────────────
+
+@_register("abstention")
+class AbstentionVote(Assignment):
+    """
+    A-5: Majority vote with abstention.
+
+    If the top-vote fraction is below *threshold*, the cluster is assigned
+    ``ignore_index`` (255) instead of a class label.
+
+    Parameters
+    ----------
+    threshold : float
+        Minimum vote fraction to commit to a class (default 0.6).
+    """
+
+    def __init__(self, threshold: float = 0.6) -> None:
+        self.threshold = threshold
+
+    def assign(
+        self,
+        cluster_labels: Tensor,
+        gt_mask: Tensor,
+        **kwargs: Any,
+    ) -> Dict[int, int]:
+        cl, gt = self._flatten_both(cluster_labels, gt_mask)
+        mapping: Dict[int, int] = {}
+        for c in np.unique(cl):
+            mask_c = cl == c
+            gt_c   = gt[mask_c]
+            if gt_c.size == 0:
+                mapping[int(c)] = self.IGNORE_INDEX
+                continue
+            vals, cnts = np.unique(gt_c, return_counts=True)
+            top_frac   = cnts.max() / cnts.sum()
+            if top_frac < self.threshold:
+                mapping[int(c)] = self.IGNORE_INDEX
+            else:
+                mapping[int(c)] = int(vals[cnts.argmax()])
+        return mapping
+
+
+# ── A-6: Cross-image consistency tracker ──────────────────────────────────────
+
+@_register("cross_image")
+class CrossImageConsistency(Assignment):
+    """
+    A-6: Per-image majority-vote assignment that also tracks the consistency
+    of cluster→class mapping across multiple images as a diagnostic metric.
+
+    Use :meth:`assign` per image and call :meth:`consistency_score` afterwards.
+
+    Parameters
+    ----------
+    base_method : str
+        Which per-image assignment to use under the hood (default "majority_vote").
+    """
+
+    def __init__(self, base_method: str = "majority_vote") -> None:
+        self._base = get_assignment_method(base_method)
+        self._history: Dict[int, list] = {}   # cluster_id → [class_id, ...]
+
+    def assign(
+        self,
+        cluster_labels: Tensor,
+        gt_mask: Tensor,
+        **kwargs: Any,
+    ) -> Dict[int, int]:
+        mapping = self._base.assign(cluster_labels, gt_mask, **kwargs)
+        for c_id, cls in mapping.items():
+            self._history.setdefault(c_id, []).append(cls)
+        return mapping
+
+    def consistency_score(self) -> float:
+        """
+        Returns the mean per-cluster consistency: fraction of images where the
+        most-frequent class matches.  Range [0, 1]; 1 = perfect consistency.
+        """
+        if not self._history:
+            return float("nan")
+        scores = []
+        for c_id, classes in self._history.items():
+            classes_arr          = np.array(classes)
+            vals, cnts           = np.unique(classes_arr, return_counts=True)
+            scores.append(cnts.max() / cnts.sum())
+        return float(np.mean(scores))
+
+    def reset(self) -> None:
+        """Clear the history (call between dataset folds)."""
+        self._history = {}
