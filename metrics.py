@@ -465,3 +465,20 @@ def assignment_diagnostics(
         "mean_cluster_label_entropy": mean_ent,
         "assignment_consistency":     consistency,
     }
+# ── Pretty-print metrics ──────────────────────────────────────────────────────
+
+def print_metrics(metrics: Dict[str, float]) -> None:
+    """
+    Pretty-print the metrics returned by compute_all_metrics().
+
+    Example:
+        m = compute_all_metrics(pred, gt, n_classes)
+        print_metrics(m)
+    """
+    print("\n=== Segmentation Metrics ===")
+    for k, v in metrics.items():
+        if isinstance(v, float):
+            print(f"{k:15s}: {v:.4f}")
+        else:
+            print(f"{k:15s}: {v}")
+    print("============================\n")
