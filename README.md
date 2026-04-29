@@ -70,14 +70,15 @@ README.md
 
 ### Assignment (`assignment.py`)
 
-| ID  | Name               | Description                                                  |
-|-----|--------------------|--------------------------------------------------------------|
-| A-1 | `majority_vote`    | Most frequent GT label per cluster                          |
-| A-2 | `weighted_majority`| Majority weighted by inverse distance to centroid            |
-| A-3 | `hungarian`        | Hungarian matching via IoU cost matrix                       |
-| A-4 | `label_propagation`| Soft assignment via K-NN label propagation                   |
-| A-5 | `abstention`       | Majority vote + abstain (→ 255) if confidence < threshold    |
-| A-6 | `cross_image`      | Per-image majority + cross-image consistency metric          |
+| ID  | Name                    | Description                                                  |
+|-----|-------------------------|--------------------------------------------------------------|
+| A-1 | `majority_vote`         | Most frequent GT label per cluster                          |
+| A-2 | `weighted_majority`     | Majority weighted by inverse distance to centroid            |
+| A-3 | `hungarian`             | Hungarian matching via IoU cost matrix                       |
+| A-4 | `label_propagation`     | Soft assignment via K-NN label propagation                   |
+| A-5 | `abstention`            | Majority vote + abstain (→ 255) if confidence < threshold    |
+| A-6 | `cross_image`           | Per-image majority + cross-image consistency metric          |
+| A-7 | `mask_embedding_cosine` | **Recommended.** Cosine similarity between each cluster's mean pixel feature and the precomputed mask embedding. Foreground cluster = highest sim. Falls back to majority-vote if mask embedding is zero. |
 
 ### Post-processing (`postprocess.py`)
 
@@ -108,21 +109,34 @@ README.md
 
 ## 4. Dataset Layout
 
+The pipeline expects a **split-first** directory structure:
+
 ```
-/kaggle/input/<dataset-name>/
-    images/
-        train/  <stem>.jpg
-        test/   <stem>.jpg
-    masks/
-        train/  <stem>.png
-        test/   <stem>.png
-    embeddings/
-        train/  <stem>.npy    # shape (196, 768) for ViT-B/14
-        test/   <stem>.npy
+<dataset_path>/          # e.g. /kaggle/input/.../human-seg-dataset
+    train/
+        images/          <stem>.jpg   – original RGB images (any resolution)
+        masks/           <stem>.jpg   – grayscale GT masks (white=object)
+        embeddings/
+            patch/       <stem>.npy   shape (196, 768) – DINOv3 patch tokens
+            cls/         <stem>.npy   shape (768,)     – [CLS] token
+            mask/        <stem>.npy   shape (768,)     – avg foreground feature
+    test/
+        images/   masks/   embeddings/{patch,cls,mask}/   … same structure …
 ```
 
-The `embeddings/` directory must be precomputed with a DINOv2 model before running the
-pipeline.  Use `utils.extract_patch_tokens()` as a helper.
+### Embedding descriptions
+
+| File | Shape | Description |
+|------|-------|-------------|
+| `patch/<stem>.npy` | `(196, 768)` | Patch tokens from DINOv3-ViT-B/16. Image divided into 14×14 grid; each patch → 768-dim vector. Used for dense prediction. |
+| `cls/<stem>.npy`   | `(768,)` | `[CLS]` token; represents the whole image. Suitable for image-level tasks. |
+| `mask/<stem>.npy`  | `(768,)` | Average of patch features whose 14×14 cell overlaps the foreground mask. Zero vector if no foreground. Used by assignment A-7. |
+
+### Kaggle dataset path
+
+```
+/kaggle/input/datasets/muhammadannasshaikh/dinov3-human-segmentation/human-seg-dataset
+```
 
 ---
 
@@ -131,10 +145,14 @@ pipeline.  Use `utils.extract_patch_tokens()` as a helper.
 ```python
 from dinov3_seg import Pipeline, get_default_config
 
-# Minimal config (bilinear resolution, K-Means K=8, majority vote, no post-proc)
+# Default config: bilinear resolution, K-Means K=8,
+# mask_embedding_cosine assignment, no post-proc
 cfg = get_default_config(
-    dataset="Kvasir",
-    dataset_path="/kaggle/input/kvasir-seg",
+    dataset="HumanSeg",
+    dataset_path=(
+        "/kaggle/input/datasets/muhammadannasshaikh/"
+        "dinov3-human-segmentation/human-seg-dataset"
+    ),
     n_classes=2,
     device="cuda",
 )
@@ -150,13 +168,19 @@ pipeline = Pipeline(cfg)
 metrics = pipeline.evaluate()
 # → {"miou": 0.72, "pixel_acc": 0.91, "dice": 0.83, "bf1_w2": 0.61, ...}
 
-# Single image
+# ── Single image (manual) ────────────────────────────────────────────
 import torch
-image        = torch.randn(3, 224, 224)   # your normalised image
-patch_tokens = torch.randn(196, 768)       # your DINO embeddings
-gt_mask      = torch.randint(0, 2, (224, 224))
+image          = torch.randn(3, 224, 224)    # ImageNet-normalised
+patch_tokens   = torch.randn(196, 768)       # DINO patch embeddings
+mask_embedding = torch.randn(768)            # avg foreground feature
+gt_mask        = torch.randint(0, 2, (224, 224))
 
-pred_mask = pipeline.run(image, patch_tokens=patch_tokens, gt_mask=gt_mask)
+pred_mask = pipeline.run(
+    image,
+    patch_tokens=patch_tokens,
+    gt_mask=gt_mask,
+    mask_embedding=mask_embedding,
+)
 ```
 
 ### Ablation sweep

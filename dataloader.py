@@ -2,10 +2,30 @@
 dataloader.py – Dataset loading and preprocessing for dinov3_seg.
 
 Each dataset sample is a dict with keys:
-    image        : FloatTensor (3, 224, 224)  – ImageNet-normalised
-    mask         : FloatTensor (1, 224, 224)  – binary {0, 1}
-    patch_tokens : FloatTensor (N_patches, D) – precomputed DINO embeddings
-    filename     : str
+    image          : FloatTensor (3, 224, 224)  – ImageNet-normalised
+    mask           : FloatTensor (1, 224, 224)  – binary {0, 1}
+    patch_tokens   : FloatTensor (196, 768)     – precomputed DINO patch embeddings
+    cls_embedding  : FloatTensor (768,)         – [CLS] token from DINO
+    mask_embedding : FloatTensor (768,)         – average patch feat inside GT mask
+    filename       : str
+
+Dataset layout expected on disk
+--------------------------------
+<dataset_path>/
+    train/
+        images/    <stem>.jpg
+        masks/     <stem>.jpg   (grayscale, white=object)
+        embeddings/
+            patch/ <stem>.npy   shape (196, 768)
+            cls/   <stem>.npy   shape (768,)
+            mask/  <stem>.npy   shape (768,)
+    test/
+        images/    <stem>.jpg
+        masks/     <stem>.jpg
+        embeddings/
+            patch/ <stem>.npy
+            cls/   <stem>.npy
+            mask/  <stem>.npy
 """
 
 from __future__ import annotations
@@ -18,7 +38,6 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
-from torchvision.transforms import functional as TF
 from PIL import Image
 
 
@@ -42,25 +61,28 @@ _MASK_TRANSFORM = transforms.Compose([
 
 class SegmentationDataset(Dataset):
     """
-    Loads image / mask / patch-token triplets from a structured directory.
+    Loads image / mask / embedding triplets from a structured directory.
 
     Expected layout::
 
         dataset_path/
-            images/
-                train/  <filename>.jpg  (or .png)
-                test/   ...
-            masks/
-                train/  <filename>.png
-                test/   ...
-            embeddings/
-                train/  <filename>.npy   # shape (N_patches, D)
-                test/   ...
+            train/
+                images/     <stem>.jpg   (or .jpeg / .png)
+                masks/      <stem>.jpg   (grayscale; white=object)
+                embeddings/
+                    patch/  <stem>.npy   shape (196, 768)
+                    cls/    <stem>.npy   shape (768,)
+                    mask/   <stem>.npy   shape (768,)
+            test/
+                images/     …
+                masks/      …
+                embeddings/ patch/ cls/ mask/
 
     Parameters
     ----------
     dataset_path : str | Path
-        Root directory of the dataset.
+        Root directory of the dataset  (the folder that contains
+        ``train/`` and ``test/`` sub-directories).
     split : str
         ``"train"`` or ``"test"``.
     img_transform : callable, optional
@@ -80,15 +102,28 @@ class SegmentationDataset(Dataset):
         binary_mask: bool = True,
     ) -> None:
         super().__init__()
-        self.root = Path(dataset_path)
-        self.split = split
+        self.root        = Path(dataset_path)
+        self.split       = split
         self.binary_mask = binary_mask
         self.img_transform  = img_transform  or _IMG_TRANSFORM
         self.mask_transform = mask_transform or _MASK_TRANSFORM
 
-        self.img_dir   = self.root / split / "images"      
-        self.mask_dir  = self.root / split / "masks"      
-        self.emb_dir   = self.root   / split / "embeddings"
+        # ── directories ──────────────────────────────────────────────────────
+        split_dir = self.root / split
+        self.img_dir        = split_dir / "images"
+        self.mask_dir       = split_dir / "masks"
+        self.patch_emb_dir  = split_dir / "embeddings" / "patch"
+        self.cls_emb_dir    = split_dir / "embeddings" / "cls"
+        self.mask_emb_dir   = split_dir / "embeddings" / "mask"
+
+        for d in (self.img_dir, self.mask_dir,
+                  self.patch_emb_dir, self.cls_emb_dir, self.mask_emb_dir):
+            if not d.exists():
+                raise FileNotFoundError(
+                    f"Required directory not found: {d}\n"
+                    "Check that dataset_path and split are correct and the "
+                    "dataset follows the expected layout."
+                )
 
         self.filenames = self._collect_filenames()
 
@@ -96,7 +131,7 @@ class SegmentationDataset(Dataset):
 
     def _collect_filenames(self) -> List[str]:
         """Return sorted list of base names (no extension) present in img_dir."""
-        exts = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp"}
+        exts  = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp"}
         names: List[str] = []
         for p in sorted(self.img_dir.iterdir()):
             if p.suffix.lower() in exts:
@@ -113,24 +148,28 @@ class SegmentationDataset(Dataset):
             p = self.img_dir / (stem + ext)
             if p.exists():
                 return p
-        raise FileNotFoundError(f"Image not found for stem={stem!r} in {self.img_dir}")
+        raise FileNotFoundError(
+            f"Image not found for stem={stem!r} in {self.img_dir}"
+        )
 
     def _find_mask(self, stem: str) -> Path:
-        for ext in (".png", ".jpg", ".jpeg", ".tif", ".bmp"):
+        for ext in (".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp"):
             p = self.mask_dir / (stem + ext)
             if p.exists():
                 return p
-        raise FileNotFoundError(f"Mask not found for stem={stem!r} in {self.mask_dir}")
+        raise FileNotFoundError(
+            f"Mask not found for stem={stem!r} in {self.mask_dir}"
+        )
 
-    def _load_patch_tokens(self, stem: str) -> torch.Tensor:
-        """Load precomputed patch embeddings from a .npy file."""
-        npy_path = self.emb_dir / (stem + ".npy")
+    def _load_npy(self, directory: Path, stem: str, desc: str) -> torch.Tensor:
+        """Load a .npy file from *directory*/<stem>.npy and return as float32 Tensor."""
+        npy_path = directory / (stem + ".npy")
         if not npy_path.exists():
             raise FileNotFoundError(
-                f"Embedding not found: {npy_path}. "
-                "Ensure embeddings are precomputed and placed in the 'embeddings/' folder."
+                f"{desc} embedding not found: {npy_path}. "
+                "Ensure embeddings are precomputed and placed in the correct folder."
             )
-        arr = np.load(str(npy_path))           # (N_patches, D)
+        arr = np.load(str(npy_path))
         return torch.from_numpy(arr).float()
 
     # ── Dataset API ──────────────────────────────────────────────────────────
@@ -151,14 +190,22 @@ class SegmentationDataset(Dataset):
         if self.binary_mask:
             mask_tensor = (mask_tensor > 0).float()
 
-        # ── patch tokens ──
-        patch_tokens = self._load_patch_tokens(stem)                   # (N, D)
+        # ── patch embeddings  (196, 768) ──
+        patch_tokens   = self._load_npy(self.patch_emb_dir, stem, "Patch")
+
+        # ── CLS embedding  (768,) ──
+        cls_embedding  = self._load_npy(self.cls_emb_dir,   stem, "CLS")
+
+        # ── mask embedding (768,)  – mean of foreground patch features ──
+        mask_embedding = self._load_npy(self.mask_emb_dir,  stem, "Mask")
 
         return {
-            "image":        image_tensor,
-            "mask":         mask_tensor,
-            "patch_tokens": patch_tokens,
-            "filename":     stem,
+            "image":          image_tensor,
+            "mask":           mask_tensor,
+            "patch_tokens":   patch_tokens,
+            "cls_embedding":  cls_embedding,
+            "mask_embedding": mask_embedding,
+            "filename":       stem,
         }
 
 
@@ -187,7 +234,8 @@ def get_dataloaders(
     -------
     train_loader, test_loader : tuple[DataLoader, DataLoader]
         Each loader yields dicts with keys
-        ``image``, ``mask``, ``patch_tokens``, ``filename``.
+        ``image``, ``mask``, ``patch_tokens``, ``cls_embedding``,
+        ``mask_embedding``, ``filename``.
     """
     train_ds = SegmentationDataset(dataset_path, split="train", binary_mask=binary_mask)
     test_ds  = SegmentationDataset(dataset_path, split="test",  binary_mask=binary_mask)

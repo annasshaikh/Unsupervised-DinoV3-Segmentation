@@ -10,6 +10,20 @@ Usage
 >>> cfg.clustering["method"] = "kmeans_pca"
 >>> cfg.clustering["pca_dim"] = 64
 >>> pipeline = Pipeline(cfg)
+
+Dataset layout
+--------------
+The pipeline expects the new split-first layout::
+
+    <dataset_path>/
+        train/
+            images/     <stem>.jpg
+            masks/      <stem>.jpg
+            embeddings/
+                patch/  <stem>.npy   (196, 768)
+                cls/    <stem>.npy   (768,)
+                mask/   <stem>.npy   (768,)
+        test/  …same structure…
 """
 
 from __future__ import annotations
@@ -26,9 +40,11 @@ class PipelineConfig:
     Attributes
     ----------
     dataset : str
-        Dataset name, e.g. ``"Kvasir"``, ``"BCCD1"``, ``"BCCD2"``.
+        Dataset name, e.g. ``"HumanSeg"``, ``"Kvasir"``.
     dataset_path : str
         Root path to the dataset directory (under ``/kaggle/input/...``).
+        Must contain ``train/`` and ``test/`` sub-directories each with
+        ``images/``, ``masks/``, and ``embeddings/{patch,cls,mask}/``.
     batch_size : int
     num_workers : int
     device : str
@@ -53,9 +69,15 @@ class PipelineConfig:
 
     assignment : dict
         Keys: ``method`` (str), plus method-specific kwargs.
-        Method names: ``"majority_vote"``, ``"weighted_majority"``,
-        ``"hungarian"``, ``"label_propagation"``, ``"abstention"``,
-        ``"cross_image"``.
+        Method names:
+        - ``"majority_vote"``      (A-1) – most frequent GT label per cluster
+        - ``"weighted_majority"``  (A-2) – distance-weighted majority
+        - ``"hungarian"``          (A-3) – Hungarian IoU matching
+        - ``"label_propagation"``  (A-4) – K-NN label propagation
+        - ``"abstention"``         (A-5) – majority vote + abstain
+        - ``"cross_image"``        (A-6) – cross-image consistency tracking
+        - ``"mask_embedding_cosine"`` (A-7, **recommended**) – cosine sim
+          between cluster centroid and precomputed mask embedding.
 
     postprocess : list[dict]
         List of post-processors to apply in order.
@@ -77,8 +99,11 @@ class PipelineConfig:
     """
 
     # ── Dataset / runtime ────────────────────────────────────────────────────
-    dataset:       str = "Kvasir"
-    dataset_path:  str = "/kaggle/input/kvasir-seg"
+    dataset:       str = "HumanSeg"
+    dataset_path:  str = (
+        "/kaggle/input/datasets/muhammadannasshaikh/"
+        "dinov3-human-segmentation/human-seg-dataset"
+    )
     batch_size:    int = 8
     num_workers:   int = 2
     device:        str = "cuda"
@@ -110,29 +135,38 @@ class PipelineConfig:
 
 # ── Default factory ───────────────────────────────────────────────────────────
 
+_DEFAULT_DATASET_PATH = (
+    "/kaggle/input/datasets/muhammadannasshaikh/"
+    "dinov3-human-segmentation/human-seg-dataset"
+)
+
+
 def get_default_config(
-    dataset: str = "Kvasir",
-    dataset_path: str = "/kaggle/input/kvasir-seg",
+    dataset: str = "HumanSeg",
+    dataset_path: str = _DEFAULT_DATASET_PATH,
     n_classes: int = 2,
     device: str = "cuda",
 ) -> PipelineConfig:
     """
-    Return a :class:`PipelineConfig` with sensible defaults.
+    Return a :class:`PipelineConfig` with sensible defaults for the
+    DINOv3 Human-Segmentation dataset.
 
     Defaults
     --------
     * Bilinear upsampling
     * K-Means with K=8
-    * Majority-vote assignment
+    * ``mask_embedding_cosine`` assignment (A-7):
+      foreground cluster selected by cosine similarity to the precomputed
+      mask embedding — no pixel-level GT annotations needed at cluster time.
     * No post-processing
     * No low-level feature fusion
 
     Parameters
     ----------
-    dataset : str
+    dataset      : str
     dataset_path : str
-    n_classes : int
-    device : str
+    n_classes    : int
+    device       : str
 
     Returns
     -------
@@ -151,27 +185,27 @@ def get_default_config(
             "n_clusters": 8,
         },
         assignment={
-            "method": "majority_vote",
+            "method": "mask_embedding_cosine",
         },
-        postprocess=[],          # No post-processing by default
-        lowlevel=None,           # No low-level fusion by default
+        postprocess=[],   # No post-processing by default
+        lowlevel=None,    # No low-level fusion by default
     )
 
 
 # ── Preset configs ────────────────────────────────────────────────────────────
 
 def get_strong_config(
-    dataset: str = "Kvasir",
-    dataset_path: str = "/kaggle/input/kvasir-seg",
+    dataset: str = "HumanSeg",
+    dataset_path: str = _DEFAULT_DATASET_PATH,
     n_classes: int = 2,
 ) -> PipelineConfig:
     """
-    A stronger default configuration combining multiple refinement techniques.
+    A stronger configuration combining multiple refinement techniques.
 
     Uses:
     * Bicubic resolution recovery
     * K-Means PCA with K=16 and PCA dim 64
-    * Hungarian matching assignment
+    * ``mask_embedding_cosine`` assignment (A-7)
     * CRF + connected-component post-processing
     * Edge-weighted low-level fusion
     """
@@ -188,7 +222,7 @@ def get_strong_config(
             "pca_dim":    64,
         },
         assignment={
-            "method": "hungarian",
+            "method": "mask_embedding_cosine",
         },
         postprocess=[
             {"method": "dense_crf", "n_iter": 10},

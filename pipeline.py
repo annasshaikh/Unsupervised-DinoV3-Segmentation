@@ -12,6 +12,16 @@ It supports:
     * Single-image inference  : :meth:`run`
     * Full test-set evaluation : :meth:`evaluate`
     * Ablation sweeps         : :meth:`run_experiment`
+
+New in this version
+-------------------
+* ``run()`` now accepts ``mask_embedding`` (shape 768) and ``cls_embedding``
+  (shape 768) from the precomputed dataset embeddings.
+* When the assignment method is ``"mask_embedding_cosine"`` (A-7), the
+  cluster-to-class mapping is determined by cosine similarity between each
+  cluster's mean pixel-feature and the precomputed ``mask_embedding``, with
+  no need for GT pixel annotations at inference time.
+* All other assignment methods continue to work unchanged.
 """
 
 from __future__ import annotations
@@ -48,7 +58,8 @@ class Pipeline:
     >>> from dinov3_seg import Pipeline, get_default_config
     >>> cfg = get_default_config()
     >>> pipeline = Pipeline(cfg)
-    >>> pred_mask = pipeline.run(image_tensor, patch_tokens=tokens)
+    >>> pred_mask = pipeline.run(image_tensor, patch_tokens=tokens,
+    ...                          mask_embedding=mask_emb)
     """
 
     def __init__(self, config: Union[PipelineConfig, Dict[str, Any]] = None) -> None:
@@ -77,7 +88,8 @@ class Pipeline:
 
         assign_cfg  = copy.deepcopy(config.assignment)
         assign_name = assign_cfg.pop("method", "majority_vote")
-        self._assignment   = get_assignment_method(assign_name, **assign_cfg)
+        self._assignment_name = assign_name
+        self._assignment      = get_assignment_method(assign_name, **assign_cfg)
 
         self._postprocessors = []
         for pp_cfg in config.postprocess:
@@ -100,6 +112,8 @@ class Pipeline:
         image: Tensor,
         patch_tokens: Optional[Tensor] = None,
         gt_mask: Optional[Tensor] = None,
+        mask_embedding: Optional[Tensor] = None,
+        cls_embedding: Optional[Tensor] = None,
         return_stages: bool = False,
     ) -> Union[Tensor, Tuple[Tensor, Dict]]:
         """
@@ -107,17 +121,21 @@ class Pipeline:
 
         Parameters
         ----------
-        image        : Tensor (3, H, W) – ImageNet-normalised
-        patch_tokens : Tensor (N, D) – precomputed patch embeddings
-        gt_mask      : Tensor (H, W) – required for assignment; if None,
-                       majority-vote assignment is skipped and cluster IDs
-                       are returned as the predicted mask.
-        return_stages : bool – if True return a dict of intermediate outputs.
+        image          : Tensor (3, H, W) – ImageNet-normalised
+        patch_tokens   : Tensor (196, 768) – precomputed patch embeddings
+        gt_mask        : Tensor (H, W) – required for most assignment methods;
+                         if None and assignment is not mask_embedding_cosine,
+                         cluster IDs are returned as-is.
+        mask_embedding : Tensor (768,) – avg patch feature inside GT mask.
+                         Required when assignment == "mask_embedding_cosine".
+        cls_embedding  : Tensor (768,) – [CLS] token (stored but not used
+                         by the pipeline core; available for downstream tasks).
+        return_stages  : bool – if True also return a dict of intermediate outputs.
 
         Returns
         -------
-        pred_mask : Tensor (H, W)
-        stage_outputs : dict (only when return_stages=True)
+        pred_mask    : Tensor (H, W)
+        stage_outputs : dict  (only when return_stages=True)
         """
         stages: Dict[str, Any] = {}
         cfg = self.config
@@ -129,8 +147,16 @@ class Pipeline:
                 "Precompute DINO embeddings and pass them here."
             )
 
-        image       = image.to(self.device)
-        patch_tokens = patch_tokens.to(self.device)         # (N, D)
+        image        = image.to(self.device)
+        patch_tokens = patch_tokens.to(self.device)          # (N, D)
+
+        if mask_embedding is not None:
+            mask_embedding = mask_embedding.to(self.device)  # (D,)
+        if cls_embedding is not None:
+            cls_embedding  = cls_embedding.to(self.device)   # (D,)
+
+        stages["cls_embedding"]  = cls_embedding
+        stages["mask_embedding"] = mask_embedding
 
         # ── 1. Resolution recovery ────────────────────────────────────────────
         # patch_tokens: (N, D) → add batch dim → (1, N, D)
@@ -138,14 +164,13 @@ class Pipeline:
             patch_tokens.unsqueeze(0),
             original_image=image.unsqueeze(0),
             target_size=cfg.target_size,
-        )[0]                                                 # (H, W, D)
+        )[0]                                                  # (H, W, D)
         stages["pixel_features"] = pixel_feats
 
         # ── 2. Low-level fusion (optional) ────────────────────────────────────
         if self._lowlevel is not None:
             ll_kwargs: Dict[str, Any] = {}
             if hasattr(self._lowlevel, "extract"):
-                # Some extractors accept dino_features
                 import inspect
                 sig = inspect.signature(self._lowlevel.extract)
                 if "dino_features" in sig.parameters:
@@ -153,10 +178,10 @@ class Pipeline:
             ll_feats = self._lowlevel.extract(image.cpu(), **ll_kwargs).to(self.device)
             # Ensure spatial alignment
             if ll_feats.shape[:2] != pixel_feats.shape[:2]:
-                H, W = pixel_feats.shape[:2]
+                H_pf, W_pf = pixel_feats.shape[:2]
                 ll_feats = F.interpolate(
                     ll_feats.permute(2, 0, 1).unsqueeze(0).float(),
-                    size=(H, W), mode="bilinear", align_corners=True,
+                    size=(H_pf, W_pf), mode="bilinear", align_corners=True,
                 )[0].permute(1, 2, 0)
             pixel_feats = fuse_features(
                 pixel_feats, ll_feats,
@@ -166,8 +191,8 @@ class Pipeline:
             stages["fused_features"] = pixel_feats
 
         # ── 3. Clustering ─────────────────────────────────────────────────────
-        H, W, D     = pixel_feats.shape
-        flat_feats  = pixel_feats.reshape(-1, D)             # (H*W, D)
+        H, W, D    = pixel_feats.shape
+        flat_feats = pixel_feats.reshape(-1, D)              # (H*W, D)
 
         # Build spatial positions for methods that use them
         rows = torch.arange(H, device=self.device).float() / H
@@ -184,11 +209,12 @@ class Pipeline:
         stages["cluster_labels"] = cluster_labels
 
         # ── 4. Assignment ─────────────────────────────────────────────────────
-        if gt_mask is not None:
-            gt_mask = gt_mask.to(self.device)
-            pred_mask = self._assignment.apply(cluster_labels, gt_mask)
-        else:
-            pred_mask = cluster_labels.long()
+        pred_mask = self._assign(
+            cluster_labels=cluster_labels,
+            gt_mask=gt_mask,
+            pixel_feats=pixel_feats,
+            mask_embedding=mask_embedding,
+        )
 
         stages["pred_mask_before_postprocess"] = pred_mask
 
@@ -200,6 +226,41 @@ class Pipeline:
         if return_stages:
             return pred_mask, stages
         return pred_mask
+
+    # ── Internal assignment router ────────────────────────────────────────────
+
+    def _assign(
+        self,
+        cluster_labels: Tensor,
+        gt_mask: Optional[Tensor],
+        pixel_feats: Tensor,
+        mask_embedding: Optional[Tensor],
+    ) -> Tensor:
+        """
+        Route to the correct assignment call depending on the chosen method.
+
+        * ``mask_embedding_cosine`` (A-7): uses mask_embedding + pixel_feats;
+          does NOT require gt_mask.
+        * All other methods: require gt_mask (falls back to cluster IDs if None).
+        """
+        if self._assignment_name == "mask_embedding_cosine":
+            # A-7 needs pixel_feats and mask_embedding; gt_mask is only for fallback
+            _gt = gt_mask if gt_mask is not None else torch.zeros(
+                cluster_labels.shape, dtype=torch.long, device=cluster_labels.device
+            )
+            return self._assignment.apply(
+                cluster_labels, _gt,
+                mask_embedding=mask_embedding,
+                pixel_features=pixel_feats,
+            )
+
+        # All other methods require gt_mask for supervised assignment
+        if gt_mask is not None:
+            gt_mask = gt_mask.to(cluster_labels.device)
+            return self._assignment.apply(cluster_labels, gt_mask)
+        else:
+            # No GT available → return raw cluster labels
+            return cluster_labels.long()
 
     # ── Evaluation ────────────────────────────────────────────────────────────
 
@@ -215,12 +276,12 @@ class Pipeline:
 
         Parameters
         ----------
-        dataloader : DataLoader or None
+        dataloader   : DataLoader or None
             If None, one is built from ``config.dataset_path``.
         dataset_path : str, optional
             Override ``config.dataset_path``.
-        split : str
-        verbose : bool
+        split        : str
+        verbose      : bool
 
         Returns
         -------
@@ -236,26 +297,38 @@ class Pipeline:
                 num_workers=self.config.num_workers,
             )
             if split == "train":
-                train_loader, _ = get_dataloaders(dp, batch_size=1, num_workers=self.config.num_workers)
+                train_loader, _ = get_dataloaders(
+                    dp, batch_size=1, num_workers=self.config.num_workers
+                )
                 dataloader = train_loader
             else:
                 dataloader = test_loader
 
         all_metrics: List[Dict[str, float]] = []
         for batch in dataloader:
-            images       = batch["image"]         # (B, 3, H, W)
-            masks        = batch["mask"]          # (B, 1, H, W)
-            patch_tokens = batch["patch_tokens"]  # (B, N, D)
+            images         = batch["image"]          # (B, 3, H, W)
+            masks          = batch["mask"]           # (B, 1, H, W)
+            patch_tokens   = batch["patch_tokens"]   # (B, 196, D)
+            cls_embeddings = batch["cls_embedding"]  # (B, D)
+            mask_embeddings= batch["mask_embedding"] # (B, D)
 
             B = images.shape[0]
             for b in range(B):
-                img    = images[b]
-                gt     = masks[b, 0].long()
-                tokens = patch_tokens[b]
+                img     = images[b]
+                gt      = masks[b, 0].long()
+                tokens  = patch_tokens[b]
+                cls_emb = cls_embeddings[b]
+                mask_emb= mask_embeddings[b]
 
                 try:
-                    pred = self.run(img, patch_tokens=tokens, gt_mask=gt)
-                    m    = compute_all_metrics(pred, gt, self.config.n_classes)
+                    pred = self.run(
+                        img,
+                        patch_tokens=tokens,
+                        gt_mask=gt,
+                        mask_embedding=mask_emb,
+                        cls_embedding=cls_emb,
+                    )
+                    m = compute_all_metrics(pred, gt, self.config.n_classes)
                     all_metrics.append(m)
                 except Exception as exc:
                     warnings.warn(f"[Pipeline.evaluate] Error on sample: {exc}")
@@ -294,9 +367,9 @@ class Pipeline:
             (e.g. ``"clustering.n_clusters"``), mapping to a list of values
             to try.  Currently supports single-parameter sweeps (the first
             key/value pair is used for the sweep; others are fixed).
-        dataloader : DataLoader or None
+        dataloader   : DataLoader or None
         fixed_config : PipelineConfig or None  – base config to sweep from.
-        verbose : bool
+        verbose      : bool
 
         Returns
         -------
@@ -308,13 +381,13 @@ class Pipeline:
         except ImportError:
             raise ImportError("pandas is required for run_experiment.")
 
-        base_cfg  = copy.deepcopy(fixed_config or self.config)
-        rows      = []
+        base_cfg = copy.deepcopy(fixed_config or self.config)
+        rows     = []
 
         for param_path, values in sweep.items():
             for val in values:
                 # Apply value to config
-                cfg = copy.deepcopy(base_cfg)
+                cfg  = copy.deepcopy(base_cfg)
                 keys = param_path.split(".")
                 obj  = cfg
                 for k in keys[:-1]:
@@ -325,11 +398,14 @@ class Pipeline:
                     setattr(obj, keys[-1], val)
 
                 # Run pipeline
-                pl = Pipeline(cfg)
-                m  = pl.evaluate(dataloader=dataloader, verbose=False)
+                pl  = Pipeline(cfg)
+                m   = pl.evaluate(dataloader=dataloader, verbose=False)
                 row = {param_path: val, **m}
                 rows.append(row)
                 if verbose:
-                    print(f"  {param_path}={val!r}  →  mIoU={m.get('miou', float('nan')):.4f}")
+                    print(
+                        f"  {param_path}={val!r}  →  "
+                        f"mIoU={m.get('miou', float('nan')):.4f}"
+                    )
 
         return pd.DataFrame(rows)

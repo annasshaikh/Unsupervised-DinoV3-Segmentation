@@ -7,12 +7,13 @@ All methods inherit from :class:`Assignment` and implement::
 
 Registered methods
 ------------------
-A-1  majority_vote      – Majority-vote per cluster
-A-2  weighted_majority  – Weighted majority vote (soft distance weighting)
-A-3  hungarian          – Hungarian matching via IoU cost matrix
-A-4  label_propagation  – Soft assignment with label propagation
-A-5  abstention         – Majority vote + abstain if confidence < threshold
-A-6  cross_image        – Per-image assignment + cross-image consistency metric
+A-1  majority_vote          – Majority-vote per cluster
+A-2  weighted_majority      – Weighted majority vote (soft distance weighting)
+A-3  hungarian              – Hungarian matching via IoU cost matrix
+A-4  label_propagation      – Soft assignment with label propagation
+A-5  abstention             – Majority vote + abstain if confidence < threshold
+A-6  cross_image            – Per-image assignment + cross-image consistency metric
+A-7  mask_embedding_cosine  – Assign foreground cluster via cosine sim to mask embedding
 """
 
 from __future__ import annotations
@@ -417,3 +418,141 @@ class CrossImageConsistency(Assignment):
     def reset(self) -> None:
         """Clear the history (call between dataset folds)."""
         self._history = {}
+
+
+# ── A-7: Mask-embedding cosine similarity assignment ─────────────────────────
+
+@_register("mask_embedding_cosine")
+class MaskEmbeddingCosine(Assignment):
+    """
+    A-7: Assign clusters to foreground / background using cosine similarity
+    between each cluster's mean patch embedding and the precomputed mask
+    embedding (average of patch features inside the GT mask region).
+
+    The cluster whose mean embedding is *most similar* to the mask embedding
+    is assigned **foreground** (class 1); all others are assigned
+    **background** (class 0).
+
+    If ``mask_embedding`` is a zero vector (no foreground pixels in image),
+    the method falls back to majority-vote.
+
+    This method is **annotation-free at clustering time** — it only uses the
+    precomputed ``mask_embedding`` vectors that encode the foreground region's
+    appearance in DINO feature space.
+
+    Parameters
+    ----------
+    n_classes : int
+        Number of semantic classes (default 2: background + foreground).
+    fallback : str
+        Assignment method to use when mask_embedding is zero (default
+        ``"majority_vote"``).
+    """
+
+    def __init__(
+        self,
+        n_classes: int = 2,
+        fallback: str = "majority_vote",
+    ) -> None:
+        self.n_classes = n_classes
+        self._fallback = get_assignment_method(fallback)
+
+    # ------------------------------------------------------------------
+    # Core method
+    # ------------------------------------------------------------------
+
+    def assign(
+        self,
+        cluster_labels: Tensor,
+        gt_mask: Tensor,
+        mask_embedding: Optional[Tensor] = None,
+        pixel_features: Optional[Tensor] = None,
+        **kwargs,
+    ) -> Dict[int, int]:
+        """
+        Parameters
+        ----------
+        cluster_labels  : Tensor (N,) or (H, W)
+        gt_mask         : Tensor (H, W)  – used only for fallback
+        mask_embedding  : Tensor (768,)  – precomputed region embedding
+        pixel_features  : Tensor (H, W, D) or (N, D)
+            Per-pixel DINO features (upsampled patch tokens).
+            If None and cluster_labels has a spatial shape, patch-level
+            centroids are computed from *cluster_labels* only (less accurate).
+        """
+        if mask_embedding is None:
+            return self._fallback.assign(cluster_labels, gt_mask)
+
+        me = mask_embedding.float().cpu()
+
+        # Fallback: zero mask embedding means no foreground → use majority vote
+        if me.norm() < 1e-6:
+            return self._fallback.assign(cluster_labels, gt_mask)
+
+        me = me / (me.norm() + 1e-8)  # L2-normalise
+
+        flat_cl = cluster_labels.reshape(-1).cpu()
+        cluster_ids = flat_cl.unique().tolist()
+
+        # ── Compute mean feature per cluster ────────────────────────────────
+        if pixel_features is not None:
+            feats = pixel_features.reshape(-1, pixel_features.shape[-1]).float().cpu()
+            centroids: Dict[int, Tensor] = {}
+            for c_id in cluster_ids:
+                mask_c = (flat_cl == int(c_id))
+                if mask_c.any():
+                    centroids[int(c_id)] = feats[mask_c].mean(dim=0)
+                else:
+                    centroids[int(c_id)] = torch.zeros(feats.shape[1])
+        else:
+            # No pixel features provided — we cannot compute real centroids.
+            # Fallback gracefully to majority vote.
+            return self._fallback.assign(cluster_labels, gt_mask)
+
+        # ── Cosine similarity between each centroid and mask_embedding ───────
+        sims: Dict[int, float] = {}
+        for c_id, centroid in centroids.items():
+            norm_c = centroid / (centroid.norm() + 1e-8)
+            sims[int(c_id)] = float(torch.dot(norm_c, me))
+
+        # Cluster with highest cosine sim → foreground (class 1)
+        fg_cluster = max(sims, key=sims.get)
+
+        mapping: Dict[int, int] = {}
+        for c_id in cluster_ids:
+            mapping[int(c_id)] = 1 if int(c_id) == fg_cluster else 0
+
+        return mapping
+
+    # ------------------------------------------------------------------
+    # Override apply() to thread pixel_features through
+    # ------------------------------------------------------------------
+
+    def apply(
+        self,
+        cluster_labels: Tensor,
+        gt_mask: Tensor,
+        mask_embedding: Optional[Tensor] = None,
+        pixel_features: Optional[Tensor] = None,
+    ) -> Tensor:
+        """
+        Apply the cosine-similarity mapping and return a predicted mask (H, W).
+
+        Parameters
+        ----------
+        cluster_labels  : Tensor (H, W)
+        gt_mask         : Tensor (H, W)
+        mask_embedding  : Tensor (768,)
+        pixel_features  : Tensor (H, W, D)
+        """
+        H, W    = gt_mask.shape
+        flat_cl = cluster_labels.reshape(-1).long()
+        mapping = self.assign(
+            flat_cl, gt_mask,
+            mask_embedding=mask_embedding,
+            pixel_features=pixel_features,
+        )
+        pred = torch.full((flat_cl.numel(),), self.IGNORE_INDEX, dtype=torch.long)
+        for c_id, cls in mapping.items():
+            pred[flat_cl == c_id] = cls
+        return pred.reshape(H, W)
