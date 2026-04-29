@@ -86,9 +86,9 @@ class SegmentationDataset(Dataset):
         self.img_transform  = img_transform  or _IMG_TRANSFORM
         self.mask_transform = mask_transform or _MASK_TRANSFORM
 
-        self.img_dir   = self.root / "images"      / split
-        self.mask_dir  = self.root / "masks"       / split
-        self.emb_dir   = self.root / "embeddings"  / split
+        self.img_dir   = self.root / split / "images"      
+        self.mask_dir  = self.root / split / "masks"      
+        self.emb_dir   = self.root   / split / "embeddings"
 
         self.filenames = self._collect_filenames()
 
