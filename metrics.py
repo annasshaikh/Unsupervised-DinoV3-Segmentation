@@ -495,18 +495,25 @@ def assignment_diagnostics(
     }
 # ── Pretty-print metrics ──────────────────────────────────────────────────────
 
-def print_metrics(metrics: Dict[str, float]) -> None:
+def print_metrics(metrics: Dict[str, float], title: str = "Segmentation Metrics") -> None:
     """
     Pretty-print the metrics returned by compute_all_metrics().
+
+    Parameters
+    ----------
+    metrics : dict
+    title   : str  (default "Segmentation Metrics")
 
     Example:
         m = compute_all_metrics(pred, gt, n_classes)
         print_metrics(m)
     """
-    print("\n=== Segmentation Metrics ===")
+    sep = "=" * (len(title) + 8)
+    print(f"\n{sep}")
+    print(f"=== {title} ===")
     for k, v in metrics.items():
         if isinstance(v, float):
-            print(f"{k:15s}: {v:.4f}")
+            print(f"  {k:18s}: {v:.4f}")
         else:
-            print(f"{k:15s}: {v}")
-    print("============================\n")
+            print(f"  {k:18s}: {v}")
+    print(f"{sep}\n")

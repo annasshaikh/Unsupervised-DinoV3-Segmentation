@@ -1,0 +1,251 @@
+# =============================================================================
+# experiments_clustering_ll.yaml 
+# Exploration of Clustering and Low-Level Features
+# =============================================================================
+#
+# Constraints:
+# - Resolution: none
+# - Assignment: mask_embedding_cosine
+# - Clustering: 7 methods with hyperparameter exploration
+# - Low-level: 9 feature methods
+# =============================================================================
+
+# ── Datasets ──────────────────────────────────────────────────────────────────
+datasets:
+  - name: "Kvasir"
+    path: "/kaggle/input/datasets/muhammadannasshaikh/kavasir-seg-dataset/Kvasir-SEG-Dataset"
+    n_classes: 2
+    split: "test"
+    max_samples: null
+
+  - name: "Human"
+    path: "/kaggle/input/datasets/muhammadannasshaikh/dinov3-human-segmentation/human-seg-dataset"
+    n_classes: 2
+    split: "test"
+    max_samples: null
+
+# ── Runtime ───────────────────────────────────────────────────────────────────
+runtime:
+  device: "cuda"
+  batch_size: 1
+  num_workers: 2
+  seed: 42
+
+# ── Output ────────────────────────────────────────────────────────────────────
+output:
+  root: "./experiment_outputs_clustering_ll"
+  save_visualisations: true
+  save_intermediate: true
+  vis_every_n_images: 5
+  vis_max_images: 20
+  save_results_jsonl: true
+  save_summary_csv: true
+  save_confusion_matrix: true
+  save_per_image_metrics: true
+
+# ── Caching ────────────────────────────────────────────────────────────────────
+cache:
+  enabled: true
+  dir: "./experiment_cache"
+
+# ── Visualisation config ──────────────────────────────────────────────────────
+visualisation:
+  dpi: 120
+  colormap_clusters: "tab20"
+  colormap_features: "viridis"
+  colormap_lowlevel: "plasma"
+  show_pca_components: [0, 1, 2]
+  n_pca_vis_components: 3
+  lowlevel_individual_channels: true
+  show_cosine_similarity_map: true
+  show_cluster_centroid_distances: true
+
+# ── Resolution ─────────────────────────────────────────────────────────────
+resolution:
+  - id: none
+    method: none
+
+# ── Clustering ────────────────────────────────────────────────────────────────
+clustering:
+
+  # 1. Standard K-Means (exploration of K)
+  - id: kmeans_k4
+    method: kmeans
+    kwargs:
+      n_clusters: 4
+
+  - id: kmeans_k8
+    method: kmeans
+    kwargs:
+      n_clusters: 8
+
+  - id: kmeans_k16
+    method: kmeans
+    kwargs:
+      n_clusters: 16
+
+  # 2. K-Means with PCA pre-processing (exploration of PCA dims)
+  - id: kmeans_pca_k8_d16
+    method: kmeans_pca
+    kwargs:
+      n_clusters: 8
+      pca_dim: 16
+
+  - id: kmeans_pca_k8_d32
+    method: kmeans_pca
+    kwargs:
+      n_clusters: 8
+      pca_dim: 32
+
+  - id: kmeans_pca_k16_d64
+    method: kmeans_pca
+    kwargs:
+      n_clusters: 16
+      pca_dim: 64
+
+  # 3. HDBSCAN (density-based, exploration of min_cluster_size)
+  - id: hdbscan_min25
+    method: hdbscan
+    kwargs:
+      min_cluster_size: 25
+
+  - id: hdbscan_min50
+    method: hdbscan
+    kwargs:
+      min_cluster_size: 50
+
+  # 4. Spectral clustering (exploration of K)
+  - id: spectral_k4
+    method: spectral
+    kwargs:
+      n_clusters: 4
+
+  - id: spectral_k8
+    method: spectral
+    kwargs:
+      n_clusters: 8
+
+  # 5. Agglomerative (hierarchical) clustering, ward linkage
+  - id: hierarchical_k4_ward
+    method: hierarchical
+    kwargs:
+      n_clusters: 4
+      linkage: ward
+
+  - id: hierarchical_k8_ward
+    method: hierarchical
+    kwargs:
+      n_clusters: 8
+      linkage: ward
+
+  # 6. Agglomerative (hierarchical) clustering, average linkage
+  - id: hierarchical_k8_avg
+    method: hierarchical
+    kwargs:
+      n_clusters: 8
+      linkage: average
+      
+  # 7. Agglomerative (hierarchical) clustering, complete linkage
+  - id: hierarchical_k8_complete
+    method: hierarchical
+    kwargs:
+      n_clusters: 8
+      linkage: complete
+
+# ── Low-level feature fusion ──────────────────────────────────────────────────
+lowlevel:
+
+  # 1. Baseline: no low-level features
+  - id: none
+    method: null
+
+  # 2. Color histogram
+  - id: color_hist
+    method: color_hist
+    fusion_mode: concat
+    low_weight: 1.0
+    kwargs:
+      n_bins: 8
+      patch_grid: 14
+
+  # 3. HOG
+  - id: hog
+    method: hog
+    fusion_mode: concat
+    low_weight: 1.0
+    kwargs:
+      orientations: 9
+      pixels_per_cell: [8, 8]
+      cells_per_block: [2, 2]
+
+  # 4. LBP
+  - id: lbp
+    method: lbp
+    fusion_mode: concat
+    low_weight: 1.0
+    kwargs:
+      radius: 1
+      n_points: 8
+
+  # 5. SLIC superpixel pooling
+  - id: slic_pool
+    method: slic_pool
+    fusion_mode: concat
+    low_weight: 0.5
+    kwargs:
+      n_segments: 200
+      compactness: 10.0
+
+  # 6. Edge-weighted (Sobel)
+  - id: edge_avg
+    method: edge_avg
+    fusion_mode: concat
+    low_weight: 1.0
+    kwargs: {}
+
+  # 7. Watershed over DINO PCA
+  - id: watershed
+    method: watershed
+    fusion_mode: concat
+    low_weight: 0.5
+    kwargs:
+      pca_dim: 3
+      compactness: 0.0
+
+  # 8. Late fusion of color_hist + hog
+  - id: late_fusion_color_hog
+    method: late_fusion
+    fusion_mode: concat
+    low_weight: 1.0
+    kwargs:
+      extractor_a: color_hist
+      extractor_b: hog
+      mode: concat
+
+  # 9. Late fusion of lbp + edge_avg
+  - id: late_fusion_lbp_edge
+    method: late_fusion
+    fusion_mode: concat
+    low_weight: 1.0
+    kwargs:
+      extractor_a: lbp
+      extractor_b: edge_avg
+      mode: concat
+
+# ── Assignment ────────────────────────────────────────────────────────────────
+assignment:
+  - id: mask_embedding_cosine
+    method: mask_embedding_cosine
+    kwargs: {}
+
+# ── Filters / overrides ───────────────────────────────────────────────────────
+filter:
+  enabled_resolution:  []
+  enabled_clustering:  []
+  enabled_lowlevel:    []
+  enabled_assignment:  []
+  skip_ids: []
+
+# ── Quick-test mode ────────────────────────────────────────────────────────────
+quick_test:
+  enabled: false

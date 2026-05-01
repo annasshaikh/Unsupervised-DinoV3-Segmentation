@@ -1,0 +1,301 @@
+# =============================================================================
+# experiments.yaml – Full Combinatorial Ablation for DINOv3 Segmentation
+# =============================================================================
+#
+# Design philosophy
+# -----------------
+# Every section (resolution / clustering / lowlevel / assignment) is independent.
+# The runner produces the Cartesian product of:
+#   • resolution methods   (6 options incl. "none")
+#   • clustering methods   (7 options)
+#   • lowlevel features    (8 options + None)
+#   • assignment methods   (7 options)
+#
+# Full grid = 6 × 7 × 9 × 7 = 2,646 experiments.
+# Use the `filter` section to restrict which axes vary or to freeze some dims.
+#
+# Resume support: completed experiments are recorded in the output directory's
+# `results.jsonl` file; the runner skips any experiment whose ID already appears
+# there.  Delete / rename that file to re-run everything.
+#
+# Caching: pixel features for each (image, resolution) pair are cached to disk
+# so repeated runs with different clustering/assignment settings need not
+# re-compute the upsampling step.
+# =============================================================================
+
+# ── Dataset ───────────────────────────────────────────────────────────────────
+dataset:
+  name: "HumanSeg"
+  path: "/kaggle/input/datasets/muhammadannasshaikh/dinov3-human-segmentation/human-seg-dataset"
+  n_classes: 2
+  split: "test"          # which split to evaluate on
+  max_samples: null      # null = use all; set integer to limit (e.g. 50 for quick test)
+
+# ── Runtime ───────────────────────────────────────────────────────────────────
+runtime:
+  device: "cuda"
+  batch_size: 1          # always 1 for per-image intermediate visualisations
+  num_workers: 2
+  seed: 42
+
+# ── Output ────────────────────────────────────────────────────────────────────
+output:
+  root: "./experiment_outputs"          # all results written here
+  save_visualisations: true             # rich per-image visualisation grids
+  save_intermediate: true              # PCA maps, cluster maps, low-level maps
+  vis_every_n_images: 5               # save visualisation for every Nth image
+  vis_max_images: 20                   # max images to visualise per experiment
+  save_results_jsonl: true             # append each result to results.jsonl
+  save_summary_csv: true               # write aggregated summary.csv at the end
+  save_confusion_matrix: true
+  save_per_image_metrics: true
+
+# ── Caching ────────────────────────────────────────────────────────────────────
+cache:
+  enabled: true
+  dir: "./experiment_cache"            # where pixel-feature caches live
+  # Each cache file is keyed by (stem, resolution_method, resolution_kwargs_hash)
+
+# ── Visualisation config ──────────────────────────────────────────────────────
+visualisation:
+  dpi: 120
+  colormap_clusters: "tab20"
+  colormap_features: "viridis"
+  colormap_lowlevel: "plasma"
+  show_pca_components: [0, 1, 2]       # which PCA components to visualise
+  n_pca_vis_components: 3              # how many PCA dims for RGB overview
+  lowlevel_individual_channels: true   # visualise each channel of low-level feats
+  show_cosine_similarity_map: true     # per-pixel cosine sim to mask_embedding
+  show_cluster_centroid_distances: true
+
+# ── Axes to sweep ─────────────────────────────────────────────────────────────
+# Each entry under a stage is one named configuration.
+# The runner takes the Cartesian product of all enabled entries.
+
+resolution:
+
+  # R-0: No upsampling (14×14 patch grid)
+  - id: none
+    method: none
+
+  # R-1: Nearest-neighbour
+  - id: nearest
+    method: nearest
+
+  # R-2: Bilinear interpolation
+  - id: bilinear
+    method: bilinear
+
+  # R-3: Bicubic interpolation
+  - id: bicubic
+    method: bicubic
+
+  # R-4: PCA interpolation (project → upsample → back-project)
+  - id: pca_32
+    method: pca
+    kwargs:
+      pca_dim: 32
+      n_centroids: 64
+
+  # R-5: Guided bilateral upsampling
+  - id: bilateral
+    method: bilateral
+    kwargs:
+      sigma_s: 1.0
+      sigma_r: 0.1
+      radius: 2
+
+# ── Clustering ────────────────────────────────────────────────────────────────
+clustering:
+
+  # C-1: Standard K-Means, K=8
+  - id: kmeans_k8
+    method: kmeans
+    kwargs:
+      n_clusters: 8
+
+  # C-1b: Standard K-Means, K=16
+  - id: kmeans_k16
+    method: kmeans
+    kwargs:
+      n_clusters: 16
+
+  # C-2: K-Means with PCA pre-processing, K=8, dim=32
+  - id: kmeans_pca_k8_d32
+    method: kmeans_pca
+    kwargs:
+      n_clusters: 8
+      pca_dim: 32
+
+  # C-2b: K-Means with PCA pre-processing, K=16, dim=64
+  - id: kmeans_pca_k16_d64
+    method: kmeans_pca
+    kwargs:
+      n_clusters: 16
+      pca_dim: 64
+
+  # C-3: HDBSCAN (density-based, K is data-driven)
+  - id: hdbscan
+    method: hdbscan
+    kwargs:
+      min_cluster_size: 50
+
+  # C-4: Spectral clustering, K=8
+  - id: spectral_k8
+    method: spectral
+    kwargs:
+      n_clusters: 8
+
+  # C-5: Agglomerative (hierarchical) clustering, K=8, ward linkage
+  - id: hierarchical_k8_ward
+    method: hierarchical
+    kwargs:
+      n_clusters: 8
+      linkage: ward
+
+# ── Low-level feature fusion ──────────────────────────────────────────────────
+# null = no low-level fusion (pure DINO baseline)
+lowlevel:
+
+  # Baseline: no low-level features
+  - id: none
+    method: null
+
+  # L-1: Color histogram (HSV, 8 bins per channel)
+  - id: color_hist
+    method: color_hist
+    fusion_mode: concat
+    low_weight: 1.0
+    kwargs:
+      n_bins: 8
+      patch_grid: 14
+
+  # L-2: HOG – histogram of oriented gradients
+  - id: hog
+    method: hog
+    fusion_mode: concat
+    low_weight: 1.0
+    kwargs:
+      orientations: 9
+      pixels_per_cell: [8, 8]
+      cells_per_block: [2, 2]
+
+  # L-3: LBP – local binary patterns
+  - id: lbp
+    method: lbp
+    fusion_mode: concat
+    low_weight: 1.0
+    kwargs:
+      radius: 1
+      n_points: 8
+
+  # L-4: SLIC superpixel pooling (uses DINO features internally)
+  - id: slic_pool
+    method: slic_pool
+    fusion_mode: concat
+    low_weight: 0.5
+    kwargs:
+      n_segments: 200
+      compactness: 10.0
+
+  # L-5: Edge-weighted (Sobel edge magnitude)
+  - id: edge_avg
+    method: edge_avg
+    fusion_mode: concat
+    low_weight: 1.0
+    kwargs: {}
+
+  # L-7: Watershed over DINO PCA
+  - id: watershed
+    method: watershed
+    fusion_mode: concat
+    low_weight: 0.5
+    kwargs:
+      pca_dim: 3
+      compactness: 0.0
+
+  # L-8: Late fusion of color_hist + hog
+  - id: late_fusion_color_hog
+    method: late_fusion
+    fusion_mode: concat
+    low_weight: 1.0
+    kwargs:
+      extractor_a: color_hist
+      extractor_b: hog
+      mode: concat
+
+  # L-8b: Late fusion of lbp + edge_avg
+  - id: late_fusion_lbp_edge
+    method: late_fusion
+    fusion_mode: concat
+    low_weight: 1.0
+    kwargs:
+      extractor_a: lbp
+      extractor_b: edge_avg
+      mode: concat
+
+# ── Assignment ────────────────────────────────────────────────────────────────
+assignment:
+
+  # A-1: Majority vote (needs GT at assignment time – supervised)
+  - id: majority_vote
+    method: majority_vote
+    kwargs: {}
+
+  # A-2: Weighted majority vote
+  - id: weighted_majority
+    method: weighted_majority
+    kwargs: {}
+
+  # A-3: Hungarian matching (IoU cost)
+  - id: hungarian
+    method: hungarian
+    kwargs: {}
+
+  # A-4: Label propagation (K-NN graph)
+  - id: label_propagation
+    method: label_propagation
+    kwargs:
+      k: 10
+      alpha: 0.8
+      n_iter: 20
+
+  # A-5: Abstention (majority vote + abstain on uncertain clusters)
+  - id: abstention_60
+    method: abstention
+    kwargs:
+      threshold: 0.6
+
+  # A-6: Cross-image consistency
+  - id: cross_image
+    method: cross_image
+    kwargs: {}
+
+  # A-7: Mask embedding cosine (annotation-free at inference)
+  - id: mask_embedding_cosine
+    method: mask_embedding_cosine
+    kwargs: {}
+
+# ── Filters / overrides ───────────────────────────────────────────────────────
+# Optionally restrict which axes to sweep.  Leave empty lists to sweep ALL.
+# Example: freeze resolution to bilinear only:
+#   enabled_resolution:  ["bilinear"]
+#   enabled_clustering:  []   # all
+filter:
+  enabled_resolution:  []   # [] = all
+  enabled_clustering:  []   # [] = all
+  enabled_lowlevel:    []   # [] = all
+  enabled_assignment:  []   # [] = all
+
+  # Skip specific experiment IDs (e.g. known-slow combos)
+  skip_ids: []
+
+# ── Quick-test mode ────────────────────────────────────────────────────────────
+# When quick_test: true, only a small subset of combinations is run
+quick_test:
+  enabled: false
+  resolution:  ["bilinear", "none"]
+  clustering:  ["kmeans_k8"]
+  lowlevel:    ["none", "color_hist"]
+  assignment:  ["mask_embedding_cosine", "majority_vote"]
+  max_samples: 10

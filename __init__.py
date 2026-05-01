@@ -14,6 +14,8 @@ Stages:
 
 from .config import PipelineConfig, get_default_config
 from .pipeline import Pipeline
+from .visualizer import Visualizer
 
 __version__ = "0.1.0"
-__all__ = ["Pipeline", "PipelineConfig", "get_default_config"]
+__all__ = ["Pipeline", "PipelineConfig", "get_default_config", "Visualizer"]
+
