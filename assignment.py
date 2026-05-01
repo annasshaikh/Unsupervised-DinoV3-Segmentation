@@ -454,9 +454,11 @@ class MaskEmbeddingCosine(Assignment):
         self,
         n_classes: int = 2,
         fallback: str = "majority_vote",
+        global_embedding: Optional[Tensor] = None,
     ) -> None:
         self.n_classes = n_classes
         self._fallback = get_assignment_method(fallback)
+        self.global_embedding = global_embedding
 
     # ------------------------------------------------------------------
     # Core method
@@ -481,10 +483,13 @@ class MaskEmbeddingCosine(Assignment):
             If None and cluster_labels has a spatial shape, patch-level
             centroids are computed from *cluster_labels* only (less accurate).
         """
-        if mask_embedding is None:
+        # Priority: 1. Passed mask_embedding, 2. self.global_embedding, 3. fallback
+        me = mask_embedding if mask_embedding is not None else self.global_embedding
+
+        if me is None:
             return self._fallback.assign(cluster_labels, gt_mask)
 
-        me = mask_embedding.float().cpu()
+        me = me.float().cpu()
 
         # Fallback: zero mask embedding means no foreground → use majority vote
         if me.norm() < 1e-6:

@@ -105,6 +105,8 @@ class Pipeline:
             self._ll_low_weight   = ll_cfg.pop("low_weight", 1.0)
             self._lowlevel        = get_lowlevel_feature(ll_name, **ll_cfg)
 
+        self._global_mask_embedding: Optional[Tensor] = None
+
     # ── Core inference ────────────────────────────────────────────────────────
 
     def run(
@@ -271,6 +273,35 @@ class Pipeline:
             # No GT available → return raw cluster labels
             return cluster_labels.long()
 
+    # ── Global Embedding Support ──────────────────────────────────────────────
+
+    def set_global_mask_embedding(self, embedding: Tensor) -> None:
+        """Set a global reference vector for MaskEmbeddingCosine (A-7)."""
+        self._global_mask_embedding = embedding
+        if self._assignment_name == "mask_embedding_cosine":
+            self._assignment.global_embedding = embedding
+
+    def compute_global_mask_embedding(self, dataloader) -> Tensor:
+        """
+        Average all mask_embeddings in the dataloader to produce a global
+        prototype vector.
+        """
+        all_embs = []
+        for batch in dataloader:
+            embs = batch["mask_embedding"]  # (B, D)
+            # Only include non-zero embeddings (images with foreground)
+            for i in range(embs.shape[0]):
+                if embs[i].norm() > 1e-6:
+                    all_embs.append(embs[i].cpu())
+
+        if not all_embs:
+            warnings.warn("No valid mask embeddings found in dataloader.")
+            return torch.zeros(768)
+
+        global_avg = torch.stack(all_embs, dim=0).mean(dim=0)
+        self.set_global_mask_embedding(global_avg)
+        return global_avg
+
     # ── Evaluation ────────────────────────────────────────────────────────────
 
     def evaluate(
@@ -278,6 +309,7 @@ class Pipeline:
         dataloader=None,
         dataset_path: Optional[str] = None,
         split: str = "test",
+        use_global_embedding: bool = False,
         verbose: bool = True,
     ) -> Dict[str, float]:
         """
@@ -290,6 +322,9 @@ class Pipeline:
         dataset_path : str, optional
             Override ``config.dataset_path``.
         split        : str
+        use_global_embedding : bool
+            If True and split is "test", the pipeline first computes (or uses)
+             the global average mask embedding from the training set.
         verbose      : bool
 
         Returns
@@ -313,6 +348,16 @@ class Pipeline:
             else:
                 dataloader = test_loader
 
+        # ── Handle Global Embedding ──
+        if use_global_embedding and split == "test":
+            if self._global_mask_embedding is None:
+                if verbose:
+                    print("Computing global mask embedding from train set...")
+                train_loader, _ = get_dataloaders(
+                    dp, batch_size=1, num_workers=self.config.num_workers
+                )
+                self.compute_global_mask_embedding(train_loader)
+
         all_metrics: List[Dict[str, float]] = []
         for batch in dataloader:
             images         = batch["image"]          # (B, 3, H, W)
@@ -327,7 +372,7 @@ class Pipeline:
                 gt      = masks[b, 0].long()
                 tokens  = patch_tokens[b]
                 cls_emb = cls_embeddings[b]
-                mask_emb= mask_embeddings[b]
+                mask_emb= None if use_global_embedding else mask_embeddings[b]
 
                 try:
                     pred = self.run(
