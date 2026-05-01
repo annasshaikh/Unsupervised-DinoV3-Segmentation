@@ -375,10 +375,14 @@ class Pipeline:
                 mask_emb= None if use_global_embedding else mask_embeddings[b]
 
                 try:
+                    # Hide ground truth from the pipeline during inference for test split
+                    # to ensure strict unsupervised evaluation without leaking GT.
+                    pipeline_gt = None if split == "test" else gt
+                    
                     pred = self.run(
                         img,
                         patch_tokens=tokens,
-                        gt_mask=gt,
+                        gt_mask=pipeline_gt,
                         mask_embedding=mask_emb,
                         cls_embedding=cls_emb,
                     )
