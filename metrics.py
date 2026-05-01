@@ -28,7 +28,30 @@ from torch import Tensor
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
+import torch.nn.functional as F
+
 IGNORE_INDEX = 255
+
+
+def _align_size(pred: Tensor, gt: Tensor) -> Tensor:
+    """Resize pred to match gt size if they differ."""
+    if pred.shape == gt.shape:
+        return pred
+
+    # Ensure (B, C, H, W) or (C, H, W) for interpolate
+    # We assume binary masks (H, W) or (B, H, W)
+    if pred.ndim == 2:
+        # (H, W) -> (1, 1, H, W)
+        p = pred.unsqueeze(0).unsqueeze(0).float()
+        p = F.interpolate(p, size=gt.shape, mode="nearest")
+        return p[0, 0].long()
+    elif pred.ndim == 3:
+        # (B, H, W) -> (B, 1, H, W)
+        p = pred.unsqueeze(1).float()
+        p = F.interpolate(p, size=gt.shape[-2:], mode="nearest")
+        return p[:, 0].long()
+
+    return pred
 
 
 def _valid(pred: np.ndarray, gt: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
@@ -64,6 +87,7 @@ def compute_miou(
     -------
     miou : float  (and optionally per_class_iou : np.ndarray)
     """
+    pred    = _align_size(pred, gt)
     pred_np = _to_np(pred.reshape(-1))
     gt_np   = _to_np(gt.reshape(-1))
     pred_np, gt_np = _valid(pred_np, gt_np)
@@ -96,6 +120,7 @@ def compute_pixel_accuracy(
     ignore_index: int = IGNORE_INDEX,
 ) -> float:
     """Overall pixel accuracy (excluding ignore pixels)."""
+    pred    = _align_size(pred, gt)
     pred_np = _to_np(pred.reshape(-1))
     gt_np   = _to_np(gt.reshape(-1))
     p, g    = _valid(pred_np, gt_np)
@@ -116,6 +141,7 @@ def compute_dice(
 
     Returns mean Dice (float) and optionally per-class Dice array.
     """
+    pred    = _align_size(pred, gt)
     pred_np = _to_np(pred.reshape(-1))
     gt_np   = _to_np(gt.reshape(-1))
     pred_np, gt_np = _valid(pred_np, gt_np)
@@ -169,6 +195,7 @@ def compute_boundary_f1(
         warnings.warn("cv2 not available; boundary F1 cannot be computed.")
         return {w: float("nan") for w in widths}
 
+    pred    = _align_size(pred, gt)
     pred_np = _to_np(pred)
     gt_np   = _to_np(gt)
 
@@ -221,6 +248,7 @@ def compute_per_class(
     _, per_iou   = compute_miou(pred, gt, n_classes, ignore_index, return_per_class=True)
     _, per_dice  = compute_dice(pred, gt, n_classes, ignore_index, return_per_class=True)
 
+    pred    = _align_size(pred, gt)
     pred_np = _to_np(pred.reshape(-1))
     gt_np   = _to_np(gt.reshape(-1))
     pred_np, gt_np = _valid(pred_np, gt_np)
