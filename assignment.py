@@ -85,9 +85,10 @@ class Assignment(ABC):
         gt_mask: Tensor,
     ) -> Tensor:
         """
-        Convenience: apply the mapping to produce a predicted mask Tensor (H, W).
+        Convenience: apply the mapping to produce a predicted mask Tensor.
+        The output shape matches cluster_labels.shape.
         """
-        H, W     = gt_mask.shape
+        H, W     = cluster_labels.shape
         flat_cl  = cluster_labels.reshape(-1).long()
         mapping  = self.assign(flat_cl, gt_mask)
         pred     = torch.full((flat_cl.numel(),), self.IGNORE_INDEX, dtype=torch.long)
@@ -536,16 +537,17 @@ class MaskEmbeddingCosine(Assignment):
         pixel_features: Optional[Tensor] = None,
     ) -> Tensor:
         """
-        Apply the cosine-similarity mapping and return a predicted mask (H, W).
+        Apply the cosine-similarity mapping and return a predicted mask.
+        The output shape matches cluster_labels.shape.
 
         Parameters
         ----------
         cluster_labels  : Tensor (H, W)
-        gt_mask         : Tensor (H, W)
+        gt_mask         : Tensor (H_gt, W_gt)
         mask_embedding  : Tensor (768,)
         pixel_features  : Tensor (H, W, D)
         """
-        H, W    = gt_mask.shape
+        H, W    = cluster_labels.shape
         flat_cl = cluster_labels.reshape(-1).long()
         mapping = self.assign(
             flat_cl, gt_mask,

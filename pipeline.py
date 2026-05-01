@@ -209,9 +209,18 @@ class Pipeline:
         stages["cluster_labels"] = cluster_labels
 
         # ── 4. Assignment ─────────────────────────────────────────────────────
+        # Align GT mask size if it differs from cluster resolution (e.g. "none" resolution)
+        _gt = gt_mask
+        if _gt is not None and _gt.shape != cluster_labels.shape:
+            _gt = F.interpolate(
+                _gt.unsqueeze(0).unsqueeze(0).float(),
+                size=cluster_labels.shape,
+                mode="nearest",
+            )[0, 0].long()
+
         pred_mask = self._assign(
             cluster_labels=cluster_labels,
-            gt_mask=gt_mask,
+            gt_mask=_gt,
             pixel_feats=pixel_feats,
             mask_embedding=mask_embedding,
         )
@@ -328,6 +337,14 @@ class Pipeline:
                         mask_embedding=mask_emb,
                         cls_embedding=cls_emb,
                     )
+                    # Align prediction to GT size if they differ (e.g. "none" resolution)
+                    if pred.shape != gt.shape:
+                        pred = F.interpolate(
+                            pred.unsqueeze(0).unsqueeze(0).float(),
+                            size=gt.shape,
+                            mode="nearest",
+                        )[0, 0].long()
+
                     m = compute_all_metrics(pred, gt, self.config.n_classes)
                     all_metrics.append(m)
                 except Exception as exc:

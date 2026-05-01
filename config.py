@@ -1,30 +1,30 @@
 """
-config.py – Pipeline configuration dataclass and defaults.
-
-The :class:`PipelineConfig` is a regular dataclass (no external dependencies).
-Nested dicts specify per-stage method names and parameters.
-
-Usage
------
->>> cfg = get_default_config()
->>> cfg.clustering["method"] = "kmeans_pca"
->>> cfg.clustering["pca_dim"] = 64
->>> pipeline = Pipeline(cfg)
-
-Dataset layout
---------------
-The pipeline expects the new split-first layout::
-
-    <dataset_path>/
-        train/
-            images/     <stem>.jpg
-            masks/      <stem>.jpg
-            embeddings/
-                patch/  <stem>.npy   (196, 768)
-                cls/    <stem>.npy   (768,)
-                mask/   <stem>.npy   (768,)
-        test/  …same structure…
-"""
+2: config.py – Pipeline configuration dataclass and defaults.
+3: 
+4: The :class:`PipelineConfig` is a regular dataclass (no external dependencies).
+5: Nested dicts specify per-stage method names and parameters.
+6: 
+7: Usage
+8: -----
+9: >>> cfg = get_default_config()
+10: >>> cfg.clustering["method"] = "kmeans_pca"
+11: >>> cfg.clustering["pca_dim"] = 64
+12: >>> pipeline = Pipeline(cfg)
+13: 
+14: Dataset layout
+15: --------------
+16: The pipeline expects the new split-first layout::
+17: 
+18:     <dataset_path>/
+19:         train/
+20:             images/     <stem>.jpg
+21:             masks/      <stem>.jpg
+22:             embeddings/
+23:                 patch/  <stem>.npy   (196, 768)
+24:                 cls/    <stem>.npy   (768,)
+25:                 mask/   <stem>.npy   (768,)
+26:         test/  …same structure…
+27: """
 
 from __future__ import annotations
 
@@ -59,7 +59,7 @@ class PipelineConfig:
 
     resolution : dict
         Keys: ``method`` (str), plus method-specific kwargs.
-        Method names: ``"nearest"``, ``"bilinear"``, ``"bicubic"``,
+        Method names: ``"none"``, ``"nearest"``, ``"bilinear"``, ``"bicubic"``,
         ``"pca"``, ``"bilateral"``.
 
     clustering : dict
@@ -193,6 +193,34 @@ def get_default_config(
 
 
 # ── Preset configs ────────────────────────────────────────────────────────────
+
+def get_small_config(
+    dataset: str = "HumanSeg",
+    dataset_path: str = _DEFAULT_DATASET_PATH,
+    n_classes: int = 2,
+) -> PipelineConfig:
+    """
+    A configuration that runs at patch resolution (no upsampling).
+    Fastest but least accurate.
+    """
+    return PipelineConfig(
+        dataset=dataset,
+        dataset_path=dataset_path,
+        n_classes=n_classes,
+        resolution={
+            "method": "none",
+        },
+        clustering={
+            "method":     "kmeans",
+            "n_clusters": 8,
+        },
+        assignment={
+            "method": "mask_embedding_cosine",
+        },
+        postprocess=[],
+        lowlevel=None,
+    )
+
 
 def get_strong_config(
     dataset: str = "HumanSeg",

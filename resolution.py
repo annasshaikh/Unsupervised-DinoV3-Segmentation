@@ -122,6 +122,23 @@ class ResolutionRecovery(ABC):
         return F.interpolate(x.float(), **kwargs)
 
 
+# ── R-0: No upsampling ────────────────────────────────────────────────────────
+
+@_register("none")
+class NoneResolution(ResolutionRecovery):
+    """R-0: No upsampling. Returns patch grid as-is (e.g. 14x14)."""
+
+    def upsample(
+        self,
+        patch_features: Tensor,
+        original_image: Optional[Tensor] = None,
+        target_size: Tuple[int, int] = (224, 224),
+    ) -> Tensor:
+        # Just reshape to spatial and return. target_size is ignored.
+        spatial = self._reshape_to_spatial(patch_features)  # (B, D, H_p, W_p)
+        return spatial.permute(0, 2, 3, 1)                  # (B, H_p, W_p, D)
+
+
 # ── R-1: Nearest neighbour ────────────────────────────────────────────────────
 
 @_register("nearest")
