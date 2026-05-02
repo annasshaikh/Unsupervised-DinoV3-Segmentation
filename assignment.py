@@ -563,3 +563,213 @@ class MaskEmbeddingCosine(Assignment):
         for c_id, cls in mapping.items():
             pred[flat_cl == c_id] = cls
         return pred.reshape(H, W)
+
+
+# ── A-8: Mask-embedding cosine similarity (notebook / global-reference style) ──
+
+@_register("mask_embedding_cosine_global")
+class MaskEmbeddingCosineGlobal(Assignment):
+    """
+    A-8: Assign the foreground cluster via per-patch cosine similarity to a
+    **global** mask-embedding reference built from training data.
+
+    This mirrors the ``PolypIdentifier`` methodology from the research notebook,
+    and differs from A-7 (``MaskEmbeddingCosine``) in two important ways:
+
+    1. **Global reference instead of per-image reference.**
+       A-7 takes a single ``mask_embedding`` vector computed *for the current
+       image* at inference time.  This class instead maintains a
+       ``global_ref`` vector that is accumulated across many training images
+       by calling :meth:`update_reference`.  At inference the same global
+       reference is used for every image, making the method truly
+       annotation-free at test time.
+
+    2. **Per-patch similarity averaging instead of centroid similarity.**
+       A-7 computes one centroid per cluster and measures cosine similarity
+       between that centroid and the reference.  This class computes the
+       cosine similarity of **every individual patch token** in the cluster
+       to the reference and averages those per-patch similarities — matching
+       ``PolypIdentifier.compute_polyp_similarity`` exactly.
+
+    Training workflow
+    -----------------
+    ::
+
+        method = MaskEmbeddingCosineGlobal()
+        for img_id in train_ids:
+            mask_emb = load_mask_embedding(img_id)   # (P, D) or (D,)
+            method.update_reference(mask_emb)
+        method.freeze_reference()                     # normalises the average
+
+    Inference workflow
+    ------------------
+    ::
+
+        mapping = method.assign(cluster_labels, gt_mask,
+                                pixel_features=patch_tokens)
+
+    Parameters
+    ----------
+    n_classes : int
+        Number of semantic classes (default 2: background + foreground).
+    fallback : str
+        Assignment method to use when no reference has been set or
+        ``pixel_features`` are absent (default ``"majority_vote"``).
+    """
+
+    def __init__(
+        self,
+        n_classes: int = 2,
+        fallback: str = "majority_vote",
+    ) -> None:
+        self.n_classes = n_classes
+        self._fallback = get_assignment_method(fallback)
+
+        # Accumulated reference state (populated via update_reference / freeze_reference)
+        self._ref_accumulator: Optional[np.ndarray] = None
+        self._ref_count: int = 0
+        self.global_ref: Optional[Tensor] = None   # final normalised reference
+
+    # ------------------------------------------------------------------
+    # Reference building (training phase)
+    # ------------------------------------------------------------------
+
+    def update_reference(self, mask_embedding: "np.ndarray | Tensor") -> None:
+        """
+        Accumulate one image's mask embedding into the global reference.
+
+        Parameters
+        ----------
+        mask_embedding : array-like (P, D) or (D,)
+            Raw (un-normalised) mask embedding for a single training image.
+            If 2-D, the patches are averaged first (matching the notebook's
+            ``mask_emb.mean(axis=0)`` step).
+        """
+        if isinstance(mask_embedding, Tensor):
+            emb = mask_embedding.float().cpu().numpy()
+        else:
+            emb = np.asarray(mask_embedding, dtype=np.float32)
+
+        if emb.ndim == 2:
+            emb = emb.mean(axis=0)   # (P, D) → (D,)
+
+        if self._ref_accumulator is None:
+            self._ref_accumulator = emb.copy()
+        else:
+            self._ref_accumulator += emb
+        self._ref_count += 1
+
+    def freeze_reference(self) -> None:
+        """
+        Finalise the global reference by averaging all accumulated embeddings.
+        Must be called once after all :meth:`update_reference` calls.
+        """
+        if self._ref_accumulator is None or self._ref_count == 0:
+            raise RuntimeError(
+                "No mask embeddings have been accumulated. "
+                "Call update_reference() for each training image first."
+            )
+        avg = self._ref_accumulator / self._ref_count          # mean across images
+        avg_t = torch.from_numpy(avg).float()
+        self.global_ref = avg_t / (avg_t.norm() + 1e-8)        # L2-normalise
+
+    def set_reference(self, ref: "np.ndarray | Tensor") -> None:
+        """
+        Directly set the global reference (e.g. loaded from disk).
+
+        Parameters
+        ----------
+        ref : array-like (D,)
+            Pre-computed global mask embedding.  Will be L2-normalised.
+        """
+        if isinstance(ref, Tensor):
+            r = ref.float().cpu()
+        else:
+            r = torch.from_numpy(np.asarray(ref, dtype=np.float32))
+        self.global_ref = r / (r.norm() + 1e-8)
+
+    # ------------------------------------------------------------------
+    # Core method
+    # ------------------------------------------------------------------
+
+    def _compute_cluster_similarity(
+        self,
+        cluster_patches: Tensor,  # (N_c, D)  raw patch features for one cluster
+        ref: Tensor,              # (D,)      already normalised
+    ) -> float:
+        """
+        Per-patch cosine similarity averaged over the cluster.
+
+        Mirrors ``PolypIdentifier.compute_polyp_similarity``:
+          1. Normalise each patch vector individually.
+          2. Dot-product each with the reference.
+          3. Return the mean similarity.
+        """
+        if cluster_patches.shape[0] == 0:
+            return 0.0
+        norms = cluster_patches.norm(dim=1, keepdim=True) + 1e-8  # (N_c, 1)
+        normalised = cluster_patches / norms                        # (N_c, D)
+        sims = (normalised @ ref)                                   # (N_c,)
+        return float(sims.mean())
+
+    def assign(
+        self,
+        cluster_labels: Tensor,
+        gt_mask: Tensor,
+        pixel_features: Optional[Tensor] = None,
+        **kwargs,
+    ) -> Dict[int, int]:
+        """
+        Parameters
+        ----------
+        cluster_labels  : Tensor (N,) or (H, W)
+        gt_mask         : Tensor (H, W)  – used only for fallback
+        pixel_features  : Tensor (H, W, D) or (N, D)
+            Per-pixel / per-patch DINO features.  Required; falls back to
+            majority vote if absent.
+        """
+        if self.global_ref is None:
+            return self._fallback.assign(cluster_labels, gt_mask)
+
+        if pixel_features is None:
+            return self._fallback.assign(cluster_labels, gt_mask)
+
+        ref = self.global_ref.float().cpu()   # (D,)  already normalised
+
+        flat_cl   = cluster_labels.reshape(-1).cpu()
+        feats     = pixel_features.reshape(-1, pixel_features.shape[-1]).float().cpu()
+        cluster_ids = flat_cl.unique().tolist()
+
+        # Per-patch similarity averaged per cluster  (notebook methodology)
+        sims: Dict[int, float] = {}
+        for c_id in cluster_ids:
+            mask_c = flat_cl == int(c_id)
+            cluster_patches = feats[mask_c]           # (N_c, D)
+            sims[int(c_id)] = self._compute_cluster_similarity(cluster_patches, ref)
+
+        # Cluster with highest mean per-patch cosine sim → foreground (class 1)
+        fg_cluster = max(sims, key=sims.__getitem__)
+
+        mapping: Dict[int, int] = {}
+        for c_id in cluster_ids:
+            mapping[int(c_id)] = 1 if int(c_id) == fg_cluster else 0
+
+        return mapping
+
+    # ------------------------------------------------------------------
+    # Override apply() to thread pixel_features through
+    # ------------------------------------------------------------------
+
+    def apply(
+        self,
+        cluster_labels: Tensor,
+        gt_mask: Tensor,
+        pixel_features: Optional[Tensor] = None,
+    ) -> Tensor:
+        H, W    = cluster_labels.shape
+        flat_cl = cluster_labels.reshape(-1).long()
+        mapping = self.assign(flat_cl, gt_mask, pixel_features=pixel_features)
+        pred = torch.full((flat_cl.numel(),), self.IGNORE_INDEX, dtype=torch.long)
+        for c_id, cls in mapping.items():
+            pred[flat_cl == c_id] = cls
+        return pred.reshape(H, W)
