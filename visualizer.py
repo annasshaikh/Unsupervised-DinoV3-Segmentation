@@ -110,7 +110,7 @@ class Visualizer:
         self.cmap_features = cmap_features
         self.cmap_lowlevel = cmap_lowlevel
 
-        for sub in ("pca", "clusters", "lowlevel", "cosine", "grids", "lowlevel_channels"):
+        for sub in ("pca", "clusters", "lowlevel", "cosine", "grids", "lowlevel_channels", "final_prediction", "lowlevel_pca", "scatter", "cluster_purity", "postprocess"):
             (self.out_dir / sub).mkdir(parents=True, exist_ok=True)
 
     # ── public entry-point ────────────────────────────────────────────────────
@@ -158,12 +158,11 @@ class Visualizer:
             self._save_clusters(stem, img_np, cluster_labels.cpu().numpy())
 
         # 3. Low-level feature channels (if present in stages)
-        if "fused_features" in stages and pixel_feats is not None:
-            # low-level slice = fused[..., D_dino:]
-            D_dino = pixel_feats.shape[-1]
-            ll_feats = stages["fused_features"][..., D_dino:].cpu().numpy()
-            if ll_feats.shape[-1] > 0:
-                self._save_lowlevel_channels(stem, ll_feats, lowlevel_cfg)
+        ll_feats_tensor = stages.get("lowlevel_features")
+        if ll_feats_tensor is not None:
+            ll_feats_np = ll_feats_tensor.cpu().numpy()
+            if ll_feats_np.shape[-1] > 0:
+                self._save_lowlevel_channels(stem, ll_feats_np, lowlevel_cfg)
 
         # 4. Cosine similarity map
         if mask_embedding is not None and pixel_feats is not None:
@@ -172,6 +171,26 @@ class Visualizer:
         # 5. Master qualitative grid
         self._save_grid(stem, img_np, gt_np, pred_np,
                         cluster_labels, pixel_feats, metrics)
+
+        # 6. Final prediction mask with GT overlay
+        self._save_final_prediction(stem, img_np, gt_np, pred_np, metrics)
+
+        # 7. Low-level PCA
+        if ll_feats_tensor is not None and ll_feats_tensor.shape[-1] > 0:
+            self._save_pca(stem, ll_feats_tensor, tag="lowlevel", n_components=3)
+
+        # 8. Feature Scatter Plot
+        if fused_feats is not None and cluster_labels is not None:
+            self._save_feature_scatter(stem, fused_feats, gt_np, pred_np, cluster_labels.cpu().numpy())
+
+        # 9. Cluster Purity Histogram
+        if cluster_labels is not None:
+            self._save_cluster_purity(stem, cluster_labels.cpu().numpy(), gt_np)
+
+        # 10. Postprocessing Diff
+        before_pp = stages.get("pred_mask_before_postprocess")
+        if before_pp is not None:
+            self._save_postprocess_diff(stem, img_np, before_pp.cpu().numpy().astype(int), pred_np)
 
     # ── PCA ───────────────────────────────────────────────────────────────────
 
@@ -236,6 +255,10 @@ class Visualizer:
         cluster_rgb = labels_to_rgb(cluster_labels, self.cmap_clusters)
         H, W = cluster_labels.shape
         K = int(cluster_labels.max()) + 1
+
+        import cv2
+        if cluster_rgb.shape[:2] != img_np.shape[:2]:
+            cluster_rgb = cv2.resize(cluster_rgb, (img_np.shape[1], img_np.shape[0]), interpolation=cv2.INTER_NEAREST)
 
         # Overlay: blend cluster colours with original image
         alpha = 0.55
@@ -395,6 +418,194 @@ class Visualizer:
 
         fig.tight_layout()
         fig.savefig(self.out_dir / "grids" / f"{stem}_grid.png", bbox_inches="tight")
+        mpl_plt.close(fig)
+
+    # ── Final Prediction ───────────────────────────────────────────────────────
+
+    def _save_final_prediction(
+        self,
+        stem: str,
+        img_np: np.ndarray,
+        gt_np: np.ndarray,
+        pred_np: np.ndarray,
+        metrics: Optional[Dict[str, float]] = None,
+    ) -> None:
+        plt = _plt()
+        import matplotlib.pyplot as mpl_plt
+
+        alpha = 0.5
+        pred_rgb = labels_to_rgb(pred_np.clip(0, 1))
+        overlay  = (alpha * pred_rgb + (1 - alpha) * img_np).astype(np.uint8)
+
+        # Create diff map (Correct vs Incorrect)
+        diff_rgb = np.zeros_like(img_np)
+        correct_mask = (pred_np == gt_np) & (gt_np != 255)
+        wrong_mask   = (pred_np != gt_np) & (gt_np != 255)
+        
+        diff_rgb[correct_mask] = [0, 255, 0]   # Green for correct
+        diff_rgb[wrong_mask] = [255, 0, 0]     # Red for incorrect
+
+        diff_overlay = (alpha * diff_rgb + (1 - alpha) * img_np).astype(np.uint8)
+
+        fig, axes = mpl_plt.subplots(1, 4, figsize=(16, 4), dpi=self.dpi)
+        axes[0].imshow(img_np);       axes[0].set_title("Original Image");  axes[0].axis("off")
+        axes[1].imshow(labels_to_rgb(gt_np.clip(0, 1))); axes[1].set_title("Ground Truth"); axes[1].axis("off")
+        axes[2].imshow(overlay);      axes[2].set_title("Final Prediction"); axes[2].axis("off")
+        axes[3].imshow(diff_overlay); axes[3].set_title("Error Map (Green=OK, Red=Err)"); axes[3].axis("off")
+
+        if metrics:
+            metric_str = " | ".join(
+                f"{k}={v:.3f}" for k, v in metrics.items()
+                if isinstance(v, float) and not np.isnan(v)
+            )
+            fig.suptitle(f"Final Prediction: {stem}\n{metric_str}", fontsize=10, fontweight="bold")
+        else:
+            fig.suptitle(f"Final Prediction: {stem}", fontsize=10, fontweight="bold")
+
+        fig.tight_layout()
+        fig.savefig(self.out_dir / "final_prediction" / f"{stem}_final.png", bbox_inches="tight")
+        mpl_plt.close(fig)
+
+    # ── Intermediate Feature Diagnostics ──────────────────────────────────────
+
+    def _save_feature_scatter(
+        self,
+        stem: str,
+        feats: Tensor,
+        gt_np: np.ndarray,
+        pred_np: np.ndarray,
+        cluster_labels: np.ndarray,
+    ) -> None:
+        plt = _plt()
+        import matplotlib.pyplot as mpl_plt
+        from sklearn.decomposition import PCA
+
+        feat_np = feats.cpu().float().numpy()
+        H, W, D = feat_np.shape
+        X = feat_np.reshape(-1, D)
+        
+        import cv2
+        def _resize_to_hw(arr):
+            if arr.shape[:2] != (H, W):
+                return cv2.resize(arr.astype(np.float32), (W, H), interpolation=cv2.INTER_NEAREST).astype(int)
+            return arr.astype(int)
+            
+        gt_1d = _resize_to_hw(gt_np).reshape(-1)
+        pred_1d = _resize_to_hw(pred_np).reshape(-1)
+        cl_1d = _resize_to_hw(cluster_labels).reshape(-1)
+
+        valid = gt_1d != 255
+        X = X[valid]
+        gt_1d = gt_1d[valid]
+        pred_1d = pred_1d[valid]
+        cl_1d = cl_1d[valid]
+
+        if len(X) == 0:
+            return
+
+        max_pts = 3000
+        if len(X) > max_pts:
+            idx = np.random.choice(len(X), max_pts, replace=False)
+            X = X[idx]
+            gt_1d = gt_1d[idx]
+            pred_1d = pred_1d[idx]
+            cl_1d = cl_1d[idx]
+
+        pca = PCA(n_components=2)
+        X_2d = pca.fit_transform(X)
+
+        fig, axes = mpl_plt.subplots(1, 3, figsize=(15, 5), dpi=self.dpi)
+        
+        axes[0].scatter(X_2d[:, 0], X_2d[:, 1], c=gt_1d, cmap="coolwarm", s=5, alpha=0.7)
+        axes[0].set_title("Features Colored by Ground Truth")
+        
+        axes[1].scatter(X_2d[:, 0], X_2d[:, 1], c=cl_1d, cmap=self.cmap_clusters, s=5, alpha=0.7)
+        axes[1].set_title("Features Colored by Cluster")
+        
+        axes[2].scatter(X_2d[:, 0], X_2d[:, 1], c=pred_1d, cmap="coolwarm", s=5, alpha=0.7)
+        axes[2].set_title("Features Colored by Final Prediction")
+        
+        for ax in axes:
+            ax.set_xticks([]); ax.set_yticks([])
+
+        fig.suptitle(f"2D Feature Scatter (PCA) - {stem}", fontsize=10, fontweight="bold")
+        fig.tight_layout()
+        fig.savefig(self.out_dir / "scatter" / f"{stem}_scatter.png", bbox_inches="tight")
+        mpl_plt.close(fig)
+
+    def _save_cluster_purity(self, stem: str, cluster_labels: np.ndarray, gt_np: np.ndarray) -> None:
+        plt = _plt()
+        import matplotlib.pyplot as mpl_plt
+        import cv2
+        
+        H, W = gt_np.shape
+        if cluster_labels.shape[:2] != (H, W):
+            cluster_labels = cv2.resize(cluster_labels.astype(np.float32), (W, H), interpolation=cv2.INTER_NEAREST)
+            
+        cl_1d = cluster_labels.astype(int).reshape(-1)
+        gt_1d = gt_np.reshape(-1)
+        
+        valid = gt_1d != 255
+        cl_1d = cl_1d[valid]
+        gt_1d = gt_1d[valid]
+        
+        if len(cl_1d) == 0:
+            return
+            
+        clusters = np.unique(cl_1d)
+        bg_counts = []
+        fg_counts = []
+        
+        for c in clusters:
+            mask_c = (cl_1d == c)
+            gt_c = gt_1d[mask_c]
+            bg_counts.append(np.sum(gt_c == 0))
+            fg_counts.append(np.sum(gt_c == 1))
+            
+        fig, ax = mpl_plt.subplots(figsize=(max(6, len(clusters)*0.6), 4), dpi=self.dpi)
+        x = np.arange(len(clusters))
+        
+        ax.bar(x, bg_counts, label="GT Background (0)", color="blue", alpha=0.6)
+        ax.bar(x, fg_counts, bottom=bg_counts, label="GT Foreground (1)", color="red", alpha=0.6)
+        
+        ax.set_xticks(x)
+        ax.set_xticklabels([f"C{c}" for c in clusters])
+        ax.set_ylabel("Pixel Count")
+        ax.set_title(f"Cluster Purity (Composition) - {stem}")
+        ax.legend()
+        
+        fig.tight_layout()
+        fig.savefig(self.out_dir / "cluster_purity" / f"{stem}_purity.png", bbox_inches="tight")
+        mpl_plt.close(fig)
+
+    def _save_postprocess_diff(self, stem: str, img_np: np.ndarray, before_np: np.ndarray, after_np: np.ndarray) -> None:
+        import cv2
+        if before_np.shape[:2] != after_np.shape[:2]:
+            before_np = cv2.resize(before_np.astype(np.float32), (after_np.shape[1], after_np.shape[0]), interpolation=cv2.INTER_NEAREST).astype(int)
+
+        if np.array_equal(before_np, after_np):
+            return
+            
+        plt = _plt()
+        import matplotlib.pyplot as mpl_plt
+        
+        changed_mask = before_np != after_np
+        diff_rgb = np.zeros_like(img_np)
+        diff_rgb[changed_mask & (after_np == 1)] = [0, 255, 0] # Added pixels (Green)
+        diff_rgb[changed_mask & (after_np == 0)] = [255, 0, 0] # Removed pixels (Red)
+        
+        alpha = 0.5
+        overlay = (alpha * diff_rgb + (1 - alpha) * img_np).astype(np.uint8)
+        
+        fig, axes = mpl_plt.subplots(1, 4, figsize=(16, 4), dpi=self.dpi)
+        axes[0].imshow(img_np); axes[0].set_title("Image"); axes[0].axis("off")
+        axes[1].imshow(labels_to_rgb(before_np.clip(0, 1))); axes[1].set_title("Before Postprocess"); axes[1].axis("off")
+        axes[2].imshow(labels_to_rgb(after_np.clip(0, 1))); axes[2].set_title("After Postprocess"); axes[2].axis("off")
+        axes[3].imshow(overlay); axes[3].set_title("Diff (Green=Added, Red=Removed)"); axes[3].axis("off")
+        
+        fig.suptitle(f"Post-processing Effect - {stem}", fontsize=10, fontweight="bold")
+        fig.tight_layout()
+        fig.savefig(self.out_dir / "postprocess" / f"{stem}_postprocess.png", bbox_inches="tight")
         mpl_plt.close(fig)
 
 

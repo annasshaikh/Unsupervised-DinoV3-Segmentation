@@ -187,6 +187,7 @@ class Pipeline:
                     ll_feats.permute(2, 0, 1).unsqueeze(0).float(),
                     size=(H_pf, W_pf), mode="bilinear", align_corners=True,
                 )[0].permute(1, 2, 0)
+            stages["lowlevel_features"] = ll_feats
             pixel_feats = fuse_features(
                 pixel_feats, ll_feats,
                 mode=self._ll_fusion_mode,
