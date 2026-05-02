@@ -267,6 +267,12 @@ class SLICPool(LowLevelFeature):
             compactness=self.compactness, sigma=1, start_label=0,
         )
 
+        if dino_features is not None and dino_features.shape[:2] != (H, W):
+            dino_features = F.interpolate(
+                dino_features.permute(2, 0, 1).unsqueeze(0).float(),
+                size=(H, W), mode="bilinear", align_corners=True
+            )[0].permute(1, 2, 0)
+
         if dino_features is None:
             # Return segment IDs as a one-hot-encoded feature (D = n_segments)
             n_sp = segments.max() + 1
@@ -374,6 +380,11 @@ class SAMDINOFeature(LowLevelFeature):
             proposal_map[m["segmentation"]] = i
 
         if dino_features is not None:
+            if dino_features.shape[:2] != (H, W):
+                dino_features = F.interpolate(
+                    dino_features.permute(2, 0, 1).unsqueeze(0).float(),
+                    size=(H, W), mode="bilinear", align_corners=True
+                )[0].permute(1, 2, 0)
             feat_np = dino_features.cpu().float().numpy()                # (H, W, D)
             D       = feat_np.shape[-1]
             out     = np.zeros((H, W, D), dtype=np.float32)
@@ -419,6 +430,12 @@ class WatershedDINO(LowLevelFeature):
         if dino_features is None:
             warnings.warn("WatershedDINO: no dino_features provided. Returning zeros.")
             return torch.zeros(H, W, 1)
+
+        if dino_features.shape[:2] != (H, W):
+            dino_features = F.interpolate(
+                dino_features.permute(2, 0, 1).unsqueeze(0).float(),
+                size=(H, W), mode="bilinear", align_corners=True
+            )[0].permute(1, 2, 0)
 
         from sklearn.decomposition import PCA
         feat_np = dino_features.reshape(-1, dino_features.shape[-1]).cpu().numpy()
