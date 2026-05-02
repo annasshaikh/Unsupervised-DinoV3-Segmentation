@@ -438,3 +438,150 @@ class JointKMeans(Clustering):
         X      = self._to_numpy(features)
         labels = self._km.predict(X)
         return torch.from_numpy(labels).long()
+
+
+# ── C-8: Fitted KMeans + PCA + StandardScaler (notebook-faithful) ─────────────
+
+@_register("kmeans_pca_fitted")
+class KMeansPCAFitted(Clustering):
+    """
+    C-8: Stateful K-Means that replicates the notebook pipeline exactly.
+
+    The notebook (``MultiSegmentationPipeline``) does three things that the
+    per-image ``KMeansPCA`` (C-2) does **not**:
+
+    1. **StandardScaler fitted on all training patches jointly** — not per image.
+    2. **PCA fitted on all scaled training patches jointly** — not per image.
+    3. **KMeans fitted on all PCA-reduced training patches jointly** — not per image.
+
+    At inference (``cluster()``), only ``scaler.transform`` → ``pca.transform``
+    → ``kmeans.predict`` are called, so test images are projected into the same
+    feature space established during training.
+
+    The notebook also computes cosine similarity for the assignment step on the
+    **scaled-but-pre-PCA** space (768-dim). ``last_scaled_features`` exposes
+    the last image's features in that space so the assignment step can use them.
+
+    Training workflow
+    -----------------
+    ::
+
+        clustering = KMeansPCAFitted(n_clusters=2, pca_dim=64)
+        clustering.fit(train_patch_list)   # list of (196, 768) tensors
+
+    Inference workflow
+    ------------------
+    ::
+
+        labels = clustering.cluster(patch_tokens)   # (N,) long tensor
+
+    Parameters
+    ----------
+    n_clusters : int
+    pca_dim : int
+        Number of PCA components (notebook winning value: 64).
+    random_state : int
+    n_init : int
+    """
+
+    def __init__(
+        self,
+        n_clusters: int = 2,
+        pca_dim: int = 64,
+        random_state: int = 42,
+        n_init: int = 10,
+    ) -> None:
+        self.n_clusters   = n_clusters
+        self.pca_dim      = pca_dim
+        self.random_state = random_state
+        self.n_init       = n_init
+
+        self._scaler = None   # sklearn StandardScaler
+        self._pca    = None   # sklearn PCA
+        self._km     = None   # sklearn KMeans
+
+        # Exposes scaled-but-pre-PCA features of the last cluster() call.
+        # Shape: (N, 768). Used by A-8 for cosine similarity in original space.
+        self.last_scaled_features: Optional[np.ndarray] = None
+
+    # ------------------------------------------------------------------
+    # Training
+    # ------------------------------------------------------------------
+
+    def fit(self, feature_list) -> "KMeansPCAFitted":
+        """
+        Fit scaler, PCA and KMeans jointly on all training patches.
+
+        Parameters
+        ----------
+        feature_list : list of Tensor or ndarray, each shape (N_i, D) or (H, W, D)
+            Per-image patch embeddings from the training set.
+            Typically a list of (196, 768) arrays/tensors.
+        """
+        from sklearn.preprocessing import StandardScaler
+        from sklearn.decomposition import PCA
+        from sklearn.cluster import KMeans as _SKLearnKMeans
+
+        # Concatenate all training patches → (N_total, D)
+        arrays = []
+        for f in feature_list:
+            arr = f.cpu().numpy() if isinstance(f, Tensor) else np.asarray(f)
+            arrays.append(arr.reshape(-1, arr.shape[-1]))
+        all_patches = np.concatenate(arrays, axis=0).astype(np.float32)
+
+        # 1. StandardScaler — fitted on all training patches
+        self._scaler = StandardScaler()
+        all_scaled = self._scaler.fit_transform(all_patches)
+
+        # 2. PCA — fitted on all scaled training patches
+        dim = min(self.pca_dim, all_scaled.shape[1], all_scaled.shape[0] - 1)
+        self._pca = PCA(n_components=dim, random_state=self.random_state)
+        all_reduced = self._pca.fit_transform(all_scaled)
+        explained = self._pca.explained_variance_ratio_.sum()
+        print(f"  [KMeansPCAFitted] PCA variance explained: {explained:.2%}")
+
+        # 3. KMeans — fitted on PCA-reduced training patches
+        self._km = _SKLearnKMeans(
+            n_clusters=self.n_clusters,
+            random_state=self.random_state,
+            n_init=self.n_init,
+        )
+        self._km.fit(all_reduced)
+        print(f"  [KMeansPCAFitted] KMeans fitted with K={self.n_clusters}")
+        return self
+
+    # ------------------------------------------------------------------
+    # Inference
+    # ------------------------------------------------------------------
+
+    def cluster(
+        self,
+        features: Tensor,
+        n_clusters: Optional[int] = None,
+        spatial_positions: Optional[Tensor] = None,
+        **kwargs: Any,
+    ) -> Tensor:
+        """
+        Project features through the fitted scaler+PCA, then predict labels.
+
+        Scaled-but-pre-PCA features are stored in ``self.last_scaled_features``
+        so the assignment step can compute similarity in the original 768-dim
+        space, matching the notebook's ``original_embeddings_for_similarity``.
+        """
+        if self._km is None:
+            raise RuntimeError(
+                "KMeansPCAFitted.fit() must be called before cluster(). "
+                "Pass a list of training patch arrays/tensors to fit()."
+            )
+
+        X = self._to_numpy(features).astype(np.float32)  # (N, D)
+
+        # Apply training scaler
+        X_scaled = self._scaler.transform(X)
+        self.last_scaled_features = X_scaled   # expose for A-8 similarity
+
+        # Apply training PCA
+        X_reduced = self._pca.transform(X_scaled)
+
+        labels = self._km.predict(X_reduced)
+        return torch.from_numpy(labels).long()

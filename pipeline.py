@@ -210,6 +210,21 @@ class Pipeline:
         ).reshape(H, W).to(self.device)                      # (H, W)
         stages["cluster_labels"] = cluster_labels
 
+        # ── 3b. Resolve features for assignment ───────────────────────────────────────────
+        # For KMeansPCAFitted (C-8): similarity must be computed in the
+        # scaled-but-pre-PCA 768-dim space (the notebook's
+        # original_embeddings_for_similarity), not in upsampled pixel space.
+        from .clustering import KMeansPCAFitted
+        if (isinstance(self._clustering, KMeansPCAFitted)
+                and self._clustering.last_scaled_features is not None):
+            scaled_np = self._clustering.last_scaled_features   # (N_patches, 768)
+            patch_side = int(round(scaled_np.shape[0] ** 0.5))  # e.g. 14
+            assign_feats = (torch.from_numpy(scaled_np).float()
+                            .to(self.device)
+                            .reshape(patch_side, patch_side, -1))
+        else:
+            assign_feats = pixel_feats
+
         # ── 4. Assignment ─────────────────────────────────────────────────────
         # Align GT mask size if it differs from cluster resolution (e.g. "none" resolution)
         _gt = gt_mask
@@ -223,7 +238,7 @@ class Pipeline:
         pred_mask = self._assign(
             cluster_labels=cluster_labels,
             gt_mask=_gt,
-            pixel_feats=pixel_feats,
+            pixel_feats=assign_feats,
             mask_embedding=mask_embedding,
         )
 
@@ -405,6 +420,21 @@ class Pipeline:
                     dp, batch_size=1, num_workers=self.config.num_workers
                 )
                 self.compute_global_mask_embedding(train_loader)
+
+        # ── Fit KMeansPCAFitted on train data if needed ──────────────────────────────
+        from .clustering import KMeansPCAFitted
+        if isinstance(self._clustering, KMeansPCAFitted) and self._clustering._km is None:
+            if verbose:
+                print("Fitting KMeansPCAFitted on training patches...")
+            train_loader_fit, _ = get_dataloaders(
+                dp, batch_size=32, num_workers=self.config.num_workers
+            )
+            train_patches = []
+            for tb in train_loader_fit:
+                train_patches.extend([tb["patch_tokens"][i] for i in range(tb["patch_tokens"].shape[0])])
+            self._clustering.fit(train_patches)
+            if verbose:
+                print(f"  Fitted on {len(train_patches)} training images.")
 
         all_metrics: List[Dict[str, float]] = []
         for batch in dataloader:

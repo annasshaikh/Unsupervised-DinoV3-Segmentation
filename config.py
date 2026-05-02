@@ -311,3 +311,51 @@ def get_global_config(
         postprocess=[],
         lowlevel=None,
     )
+
+
+def get_notebook_config(
+    dataset: str = "HumanSeg",
+    dataset_path: str = _DEFAULT_DATASET_PATH,
+    n_classes: int = 2,
+    device: str = "cuda",
+) -> PipelineConfig:
+    """
+    Configuration that faithfully replicates the notebook's winning setup.
+
+    Notebook winning params: K=2, PCA=64, StandardScaler, morph_k=1, no CC.
+
+    Uses:
+    * ``"none"`` resolution (stays at 14×14 patch grid — matches notebook's predict())
+    * ``"kmeans_pca_fitted"`` clustering (C-8) — scaler+PCA+KMeans fitted jointly
+      on all training patches, then applied per test image
+    * ``"mask_embedding_cosine_global"`` assignment (A-8) — global reference
+      built from training mask embeddings, per-patch cosine similarity
+    * Morphological closing (morph_k=1) to match notebook post-processing
+
+    Call ``pipeline.evaluate(use_global_embedding=True)`` — the pipeline will
+    automatically fit the clustering and build the global reference from the
+    train split before evaluating on test.
+    """
+    return PipelineConfig(
+        dataset=dataset,
+        dataset_path=dataset_path,
+        n_classes=n_classes,
+        device=device,
+        resolution={
+            "method": "none",        # Stay at 14x14, matching notebook predict()
+        },
+        clustering={
+            "method":      "kmeans_pca_fitted",
+            "n_clusters":  2,
+            "pca_dim":     64,
+            "random_state": 42,
+            "n_init":      10,
+        },
+        assignment={
+            "method": "mask_embedding_cosine_global",
+        },
+        postprocess=[
+            {"method": "morphology", "morph_k": 1},
+        ],
+        lowlevel=None,
+    )
