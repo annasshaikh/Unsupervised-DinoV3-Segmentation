@@ -78,6 +78,11 @@ class PipelineConfig:
         - ``"cross_image"``        (A-6) – cross-image consistency tracking
         - ``"mask_embedding_cosine"`` (A-7, **recommended**) – cosine sim
           between cluster centroid and precomputed mask embedding.
+        - ``"mask_embedding_cosine_global"`` (A-8) – per-patch cosine sim to a
+          **global** reference built by averaging mask embeddings across the
+          training set. Truly annotation-free at test time; call
+          ``pipeline.compute_global_mask_embedding(train_loader)`` before
+          ``pipeline.evaluate(..., use_global_embedding=True)``.
 
     postprocess : list[dict]
         List of post-processors to apply in order.
@@ -261,4 +266,48 @@ def get_strong_config(
             "fusion_mode": "concat",
             "low_weight":  1.0,
         },
+    )
+
+
+def get_global_config(
+    dataset: str = "HumanSeg",
+    dataset_path: str = _DEFAULT_DATASET_PATH,
+    n_classes: int = 2,
+    device: str = "cuda",
+) -> PipelineConfig:
+    """
+    Configuration using A-8 (``mask_embedding_cosine_global``).
+
+    The global reference is built from the training set at evaluation time —
+    no per-image GT annotations are required at test time.
+
+    Usage
+    -----
+    ::
+
+        cfg      = get_global_config(dataset_path=...)
+        pipeline = Pipeline(cfg)
+        # Build global reference from train split:
+        pipeline.evaluate(use_global_embedding=True, split="test")
+        # -- or manually --
+        pipeline.compute_global_mask_embedding(train_loader)
+        pipeline.evaluate(use_global_embedding=True, split="test")
+    """
+    return PipelineConfig(
+        dataset=dataset,
+        dataset_path=dataset_path,
+        n_classes=n_classes,
+        device=device,
+        resolution={
+            "method": "bilinear",
+        },
+        clustering={
+            "method":     "kmeans",
+            "n_clusters": 8,
+        },
+        assignment={
+            "method": "mask_embedding_cosine_global",
+        },
+        postprocess=[],
+        lowlevel=None,
     )

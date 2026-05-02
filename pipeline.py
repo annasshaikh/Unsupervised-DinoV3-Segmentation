@@ -252,10 +252,12 @@ class Pipeline:
 
         * ``mask_embedding_cosine`` (A-7): uses mask_embedding + pixel_feats;
           does NOT require gt_mask.
+        * ``mask_embedding_cosine_global`` (A-8): uses global_ref + pixel_feats;
+          does NOT require gt_mask or a per-image mask_embedding.
         * All other methods: require gt_mask (falls back to cluster IDs if None).
         """
+        # ── A-7: per-image mask embedding ────────────────────────────────────
         if self._assignment_name == "mask_embedding_cosine":
-            # A-7 needs pixel_feats and mask_embedding; gt_mask is only for fallback
             _gt = gt_mask if gt_mask is not None else torch.zeros(
                 cluster_labels.shape, dtype=torch.long, device=cluster_labels.device
             )
@@ -265,7 +267,17 @@ class Pipeline:
                 pixel_features=pixel_feats,
             )
 
-        # All other methods require gt_mask for supervised assignment
+        # ── A-8: global reference embedding ──────────────────────────────────
+        if self._assignment_name == "mask_embedding_cosine_global":
+            _gt = gt_mask if gt_mask is not None else torch.zeros(
+                cluster_labels.shape, dtype=torch.long, device=cluster_labels.device
+            )
+            return self._assignment.apply(
+                cluster_labels, _gt,
+                pixel_features=pixel_feats,
+            )
+
+        # ── All other methods: require gt_mask ───────────────────────────────
         if gt_mask is not None:
             gt_mask = gt_mask.to(cluster_labels.device)
             return self._assignment.apply(cluster_labels, gt_mask)
@@ -276,20 +288,48 @@ class Pipeline:
     # ── Global Embedding Support ──────────────────────────────────────────────
 
     def set_global_mask_embedding(self, embedding: Tensor) -> None:
-        """Set a global reference vector for MaskEmbeddingCosine (A-7)."""
+        """Set a global reference vector for MaskEmbeddingCosine (A-7) or
+        MaskEmbeddingCosineGlobal (A-8)."""
         self._global_mask_embedding = embedding
         if self._assignment_name == "mask_embedding_cosine":
             self._assignment.global_embedding = embedding
+        elif self._assignment_name == "mask_embedding_cosine_global":
+            self._assignment.set_reference(embedding)
 
     def compute_global_mask_embedding(self, dataloader) -> Tensor:
         """
         Average all mask_embeddings in the dataloader to produce a global
         prototype vector.
+
+        For A-8 (``mask_embedding_cosine_global``), uses the proper
+        ``update_reference`` / ``freeze_reference`` accumulation path so the
+        global reference is set directly on the assignment object.
+        For A-7 (``mask_embedding_cosine``), falls back to a simple average.
         """
+        if self._assignment_name == "mask_embedding_cosine_global":
+            # Use A-8's own accumulator so freeze_reference() handles averaging
+            # and L2-normalisation correctly.
+            for batch in dataloader:
+                embs = batch["mask_embedding"]  # (B, D)
+                for i in range(embs.shape[0]):
+                    if embs[i].norm() > 1e-6:
+                        self._assignment.update_reference(embs[i].cpu())
+
+            if self._assignment._ref_count == 0:
+                warnings.warn("No valid mask embeddings found in dataloader.")
+                return torch.zeros(768)
+
+            self._assignment.freeze_reference()
+            global_avg = torch.from_numpy(
+                self._assignment._ref_accumulator / self._assignment._ref_count
+            ).float()
+            self._global_mask_embedding = global_avg
+            return global_avg
+
+        # A-7 and others: simple mean of non-zero per-image embeddings
         all_embs = []
         for batch in dataloader:
             embs = batch["mask_embedding"]  # (B, D)
-            # Only include non-zero embeddings (images with foreground)
             for i in range(embs.shape[0]):
                 if embs[i].norm() > 1e-6:
                     all_embs.append(embs[i].cpu())
@@ -349,8 +389,16 @@ class Pipeline:
                 dataloader = test_loader
 
         # ── Handle Global Embedding ──
-        if use_global_embedding and split == "test":
-            if self._global_mask_embedding is None:
+        _needs_global = (
+            self._assignment_name in ("mask_embedding_cosine", "mask_embedding_cosine_global")
+            and use_global_embedding
+            and split == "test"
+        )
+        if _needs_global:
+            if self._global_mask_embedding is None and (
+                self._assignment_name != "mask_embedding_cosine_global"
+                or self._assignment.global_ref is None
+            ):
                 if verbose:
                     print("Computing global mask embedding from train set...")
                 train_loader, _ = get_dataloaders(
@@ -372,7 +420,13 @@ class Pipeline:
                 gt      = masks[b, 0].long()
                 tokens  = patch_tokens[b]
                 cls_emb = cls_embeddings[b]
-                mask_emb= None if use_global_embedding else mask_embeddings[b]
+                # For global-reference methods (A-7 with global flag, or A-8),
+                # the per-image mask_emb is not passed — the reference is already
+                # baked into the assignment object.
+                if use_global_embedding or self._assignment_name == "mask_embedding_cosine_global":
+                    mask_emb = None
+                else:
+                    mask_emb = mask_embeddings[b]
 
                 try:
                     # Hide ground truth from the pipeline during inference for test split

@@ -12,8 +12,8 @@ Stages:
     - Metrics        : evaluation utilities
 """
 
-from .config import PipelineConfig, get_default_config
+from .config import PipelineConfig, get_default_config, get_global_config
 from .pipeline import Pipeline
 
 __version__ = "0.1.0"
-__all__ = ["Pipeline", "PipelineConfig", "get_default_config"]
+__all__ = ["Pipeline", "PipelineConfig", "get_default_config", "get_global_config"]
