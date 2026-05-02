@@ -110,7 +110,7 @@ class Visualizer:
         self.cmap_features = cmap_features
         self.cmap_lowlevel = cmap_lowlevel
 
-        for sub in ("pca", "clusters", "lowlevel", "cosine", "grids", "lowlevel_channels", "final_prediction", "lowlevel_pca", "scatter", "cluster_purity", "postprocess"):
+        for sub in ("pca", "clusters", "lowlevel", "cosine", "grids", "lowlevel_channels", "final_prediction", "lowlevel_pca", "scatter", "cluster_purity", "postprocess", "master_grid"):
             (self.out_dir / sub).mkdir(parents=True, exist_ok=True)
 
     # ── public entry-point ────────────────────────────────────────────────────
@@ -149,9 +149,9 @@ class Visualizer:
 
         # 1. PCA of pixel features
         if pixel_feats is not None:
-            self._save_pca(stem, pixel_feats, tag="dino")
+            self._save_pca(stem, img_np, pixel_feats, tag="dino")
         if fused_feats is not None and fused_feats is not pixel_feats:
-            self._save_pca(stem, fused_feats, tag="fused")
+            self._save_pca(stem, img_np, fused_feats, tag="fused")
 
         # 2. Cluster map
         if cluster_labels is not None:
@@ -162,22 +162,22 @@ class Visualizer:
         if ll_feats_tensor is not None:
             ll_feats_np = ll_feats_tensor.cpu().numpy()
             if ll_feats_np.shape[-1] > 0:
-                self._save_lowlevel_channels(stem, ll_feats_np, lowlevel_cfg)
+                self._save_lowlevel_channels(stem, img_np, ll_feats_np, lowlevel_cfg)
 
         # 4. Cosine similarity map
         if mask_embedding is not None and pixel_feats is not None:
-            self._save_cosine_map(stem, pixel_feats, mask_embedding)
+            self._save_cosine_map(stem, img_np, pixel_feats, mask_embedding)
 
-        # 5. Master qualitative grid
-        self._save_grid(stem, img_np, gt_np, pred_np,
-                        cluster_labels, pixel_feats, metrics)
+        # 5. Master qualitative grid (Ultimate overview)
+        self._save_master_grid(stem, img_np, gt_np, pred_np,
+                               cluster_labels, pixel_feats, mask_embedding, ll_feats_tensor, metrics)
 
         # 6. Final prediction mask with GT overlay
         self._save_final_prediction(stem, img_np, gt_np, pred_np, metrics)
 
         # 7. Low-level PCA
         if ll_feats_tensor is not None and ll_feats_tensor.shape[-1] > 0:
-            self._save_pca(stem, ll_feats_tensor, tag="lowlevel", n_components=3)
+            self._save_pca(stem, img_np, ll_feats_tensor, tag="lowlevel", n_components=3)
 
         # 8. Feature Scatter Plot
         if fused_feats is not None and cluster_labels is not None:
@@ -197,12 +197,14 @@ class Visualizer:
     def _save_pca(
         self,
         stem: str,
+        img_np: np.ndarray,
         feats: Tensor,
         tag: str = "dino",
         n_components: int = 6,
     ) -> None:
         plt = _plt()
         import matplotlib.pyplot as mpl_plt
+        import cv2
 
         feat_np = feats.cpu().float().numpy()  # (H,W,D)
         H, W, D = feat_np.shape
@@ -215,25 +217,34 @@ class Visualizer:
 
         # RGB overview (first 3 components)
         rgb_pca = feat_to_rgb_pca(feat_np, n_components=3)
+        
+        # Resize to match img_np for overlay
+        if rgb_pca.shape[:2] != img_np.shape[:2]:
+            rgb_pca_rs = cv2.resize(rgb_pca, (img_np.shape[1], img_np.shape[0]), interpolation=cv2.INTER_LINEAR)
+        else:
+            rgb_pca_rs = rgb_pca
+            
+        alpha = 0.55
+        overlay = (alpha * rgb_pca_rs + (1 - alpha) * img_np).astype(np.uint8)
 
-        ncols = min(nc + 1, 7)
+        ncols = 3 + nc
         fig, axes = mpl_plt.subplots(1, ncols, figsize=(3 * ncols, 3), dpi=self.dpi)
-        if ncols == 1:
-            axes = [axes]
+        
+        axes[0].imshow(img_np); axes[0].set_title("Image", fontsize=7); axes[0].axis("off")
+        axes[1].imshow(overlay); axes[1].set_title("PCA Overlay", fontsize=7); axes[1].axis("off")
+        axes[2].imshow(rgb_pca_rs); axes[2].set_title("PCA RGB", fontsize=7); axes[2].axis("off")
 
-        axes[0].imshow(rgb_pca)
-        axes[0].set_title("PCA RGB (PC 1-3)", fontsize=7)
-        axes[0].axis("off")
-
-        for i in range(1, ncols):
-            comp = components[:, :, i - 1]
+        for i in range(nc):
+            comp = components[:, :, i]
+            if comp.shape != img_np.shape[:2]:
+                comp = cv2.resize(comp, (img_np.shape[1], img_np.shape[0]), interpolation=cv2.INTER_LINEAR)
             lo, hi = comp.min(), comp.max()
             normed = (comp - lo) / (hi - lo + 1e-6)
-            axes[i].imshow(normed, cmap=self.cmap_features, vmin=0, vmax=1)
-            axes[i].set_title(
-                f"PC{i}  ({pca.explained_variance_ratio_[i-1]:.1%})", fontsize=7
+            axes[3 + i].imshow(normed, cmap=self.cmap_features, vmin=0, vmax=1)
+            axes[3 + i].set_title(
+                f"PC{i+1}  ({pca.explained_variance_ratio_[i]:.1%})", fontsize=7
             )
-            axes[i].axis("off")
+            axes[3 + i].axis("off")
 
         fig.suptitle(f"PCA – {tag} | {stem}", fontsize=8)
         fig.tight_layout()
@@ -290,6 +301,7 @@ class Visualizer:
     def _save_lowlevel_channels(
         self,
         stem: str,
+        img_np: np.ndarray,
         ll_feats: np.ndarray,          # (H, W, D_low)
         cfg: Optional[Dict] = None,
     ) -> None:
@@ -323,15 +335,27 @@ class Visualizer:
 
         # Also save composite (mean across channels)
         mean_map = ll_feats.mean(axis=-1)
-        fig2, ax2 = mpl_plt.subplots(figsize=(4, 3.5), dpi=self.dpi)
-        im = ax2.imshow(mean_map, cmap=self.cmap_lowlevel)
-        ax2.set_title(f"Low-level mean ({method}) – {stem}", fontsize=7)
-        ax2.axis("off")
-        import matplotlib.pyplot as mpl_plt2
-        fig2.colorbar(im, ax=ax2, fraction=0.046, pad=0.04)
+        import cv2
+        if mean_map.shape != img_np.shape[:2]:
+            mean_map_rs = cv2.resize(mean_map.astype(np.float32), (img_np.shape[1], img_np.shape[0]), interpolation=cv2.INTER_LINEAR)
+        else:
+            mean_map_rs = mean_map
+            
+        mean_rgb = _scalar_to_rgb(mean_map_rs, cmap_name=self.cmap_lowlevel)
+        alpha = 0.55
+        overlay = (alpha * mean_rgb + (1 - alpha) * img_np).astype(np.uint8)
+
+        fig2, axes2 = mpl_plt.subplots(1, 3, figsize=(12, 4), dpi=self.dpi)
+        axes2[0].imshow(img_np); axes2[0].set_title("Original Image"); axes2[0].axis("off")
+        im = axes2[1].imshow(mean_map_rs, cmap=self.cmap_lowlevel)
+        axes2[1].set_title(f"Low-level mean ({method})"); axes2[1].axis("off")
+        axes2[2].imshow(overlay); axes2[2].set_title("Overlay"); axes2[2].axis("off")
+        
+        fig2.colorbar(im, ax=axes2[1], fraction=0.046, pad=0.04)
+        fig2.suptitle(f"Low-level Overlay ({method}) – {stem}", fontsize=10, fontweight="bold")
         fig2.tight_layout()
         fig2.savefig(
-            self.out_dir / "lowlevel" / f"{stem}_{method}_mean.png",
+            self.out_dir / "lowlevel" / f"{stem}_{method}_mean_overlay.png",
             bbox_inches="tight",
         )
         mpl_plt.close(fig2)
@@ -341,11 +365,13 @@ class Visualizer:
     def _save_cosine_map(
         self,
         stem: str,
+        img_np: np.ndarray,
         pixel_feats: Tensor,
         mask_embedding: Tensor,
     ) -> None:
         plt = _plt()
         import matplotlib.pyplot as mpl_plt
+        import cv2
 
         feats = pixel_feats.cpu().float()           # (H, W, D)
         me    = mask_embedding.cpu().float()
@@ -356,19 +382,32 @@ class Visualizer:
         norms = flat.norm(dim=1, keepdim=True)
         flat_n = flat / (norms + 1e-8)
         cosine = (flat_n @ me).reshape(H, W).numpy()
+        
+        if cosine.shape != img_np.shape[:2]:
+            cosine = cv2.resize(cosine, (img_np.shape[1], img_np.shape[0]), interpolation=cv2.INTER_LINEAR)
+            
+        import matplotlib.cm as cm
+        normed = (cosine + 1) / 2.0
+        cosine_rgb = (cm.get_cmap("RdBu_r")(normed)[..., :3] * 255).astype(np.uint8)
+        
+        alpha = 0.55
+        overlay = (alpha * cosine_rgb + (1 - alpha) * img_np).astype(np.uint8)
 
-        fig, ax = mpl_plt.subplots(figsize=(4.5, 3.5), dpi=self.dpi)
-        im = ax.imshow(cosine, cmap="RdBu_r", vmin=-1, vmax=1)
-        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-        ax.set_title(f"Cosine sim to mask_emb – {stem}", fontsize=7)
-        ax.axis("off")
+        fig, axes = mpl_plt.subplots(1, 3, figsize=(12, 4), dpi=self.dpi)
+        axes[0].imshow(img_np); axes[0].set_title("Original Image"); axes[0].axis("off")
+        im = axes[1].imshow(cosine, cmap="RdBu_r", vmin=-1, vmax=1)
+        axes[1].set_title("Cosine Sim to Oracle"); axes[1].axis("off")
+        axes[2].imshow(overlay); axes[2].set_title("Overlay"); axes[2].axis("off")
+        
+        fig.colorbar(im, ax=axes[1], fraction=0.046, pad=0.04)
+        fig.suptitle(f"Cosine Similarity Map – {stem}", fontsize=10, fontweight="bold")
         fig.tight_layout()
         fig.savefig(self.out_dir / "cosine" / f"{stem}_cosine.png", bbox_inches="tight")
         mpl_plt.close(fig)
 
     # ── Master qualitative grid ────────────────────────────────────────────────
 
-    def _save_grid(
+    def _save_master_grid(
         self,
         stem: str,
         img_np: np.ndarray,
@@ -376,48 +415,101 @@ class Visualizer:
         pred_np: np.ndarray,
         cluster_labels: Optional[Tensor],
         pixel_feats: Optional[Tensor],
+        mask_embedding: Optional[Tensor],
+        ll_feats_tensor: Optional[Tensor],
         metrics: Optional[Dict[str, float]] = None,
     ) -> None:
         plt = _plt()
         import matplotlib.pyplot as mpl_plt
+        import cv2
 
-        panels = [("Image", img_np, None),
-                  ("GT mask", labels_to_rgb(gt_np.clip(0, 1)), None),
-                  ("Prediction", labels_to_rgb(pred_np.clip(0, 1)), None)]
-
+        panels = []
+        
+        # 1. Image
+        panels.append(("Original Image", img_np))
+        
+        # 2. GT
+        panels.append(("Ground Truth", labels_to_rgb(gt_np.clip(0, 1))))
+        
+        # 3. Pred
+        panels.append(("Final Prediction", labels_to_rgb(pred_np.clip(0, 1))))
+        
+        # 4. Error Map
+        alpha = 0.5
+        diff_rgb = np.zeros_like(img_np)
+        correct = (pred_np == gt_np) & (gt_np != 255)
+        wrong = (pred_np != gt_np) & (gt_np != 255)
+        diff_rgb[correct] = [0, 255, 0]
+        diff_rgb[wrong] = [255, 0, 0]
+        err_overlay = (alpha * diff_rgb + (1 - alpha) * img_np).astype(np.uint8)
+        panels.append(("Error Map (G=OK, R=Err)", err_overlay))
+        
+        # 5. Cluster Overlay
         if cluster_labels is not None:
             cl_np = cluster_labels.cpu().numpy()
-            panels.append(("Clusters", labels_to_rgb(cl_np, self.cmap_clusters), None))
+            cl_rgb = labels_to_rgb(cl_np, self.cmap_clusters)
+            if cl_rgb.shape[:2] != img_np.shape[:2]:
+                cl_rgb = cv2.resize(cl_rgb, (img_np.shape[1], img_np.shape[0]), interpolation=cv2.INTER_NEAREST)
+            cl_overlay = (0.55 * cl_rgb + 0.45 * img_np).astype(np.uint8)
+            panels.append(("Cluster Overlay", cl_overlay))
+        else:
+            panels.append(("Cluster Overlay", np.zeros_like(img_np)))
 
+        # 6. PCA Overlay
         if pixel_feats is not None:
             pca_rgb = feat_to_rgb_pca(pixel_feats.cpu().numpy(), n_components=3)
-            panels.append(("DINO PCA", pca_rgb, None))
+            if pca_rgb.shape[:2] != img_np.shape[:2]:
+                pca_rgb = cv2.resize(pca_rgb, (img_np.shape[1], img_np.shape[0]), interpolation=cv2.INTER_LINEAR)
+            pca_overlay = (0.55 * pca_rgb + 0.45 * img_np).astype(np.uint8)
+            panels.append(("DINO PCA Overlay", pca_overlay))
+        else:
+            panels.append(("DINO PCA Overlay", np.zeros_like(img_np)))
 
-        # Overlay pred on image
-        alpha = 0.5
-        pred_rgb = labels_to_rgb(pred_np.clip(0, 1))
-        overlay  = (alpha * pred_rgb + (1 - alpha) * img_np).astype(np.uint8)
-        panels.append(("Pred overlay", overlay, None))
+        # 7. Cosine Overlay
+        if mask_embedding is not None and pixel_feats is not None:
+            feats = pixel_feats.cpu().float()
+            me = mask_embedding.cpu().float()
+            me = me / (me.norm() + 1e-8)
+            flat = feats.reshape(-1, feats.shape[-1])
+            flat_n = flat / (flat.norm(dim=1, keepdim=True) + 1e-8)
+            cosine = (flat_n @ me).reshape(feats.shape[0], feats.shape[1]).numpy()
+            if cosine.shape != img_np.shape[:2]:
+                cosine = cv2.resize(cosine, (img_np.shape[1], img_np.shape[0]), interpolation=cv2.INTER_LINEAR)
+            import matplotlib.cm as cm
+            normed = (cosine + 1) / 2.0
+            cos_rgb = (cm.get_cmap("RdBu_r")(normed)[..., :3] * 255).astype(np.uint8)
+            cos_overlay = (0.55 * cos_rgb + 0.45 * img_np).astype(np.uint8)
+            panels.append(("Cosine Sim Overlay", cos_overlay))
+        else:
+            panels.append(("Cosine Sim Overlay", np.zeros_like(img_np)))
 
-        N = len(panels)
-        fig, axes = mpl_plt.subplots(1, N, figsize=(3.2 * N, 3.5), dpi=self.dpi)
-        for ax, (title, arr, _) in zip(axes, panels):
+        # 8. Low-level Overlay
+        if ll_feats_tensor is not None and ll_feats_tensor.shape[-1] > 0:
+            ll_feats = ll_feats_tensor.cpu().numpy()
+            mean_map = ll_feats.mean(axis=-1)
+            if mean_map.shape != img_np.shape[:2]:
+                mean_map = cv2.resize(mean_map.astype(np.float32), (img_np.shape[1], img_np.shape[0]), interpolation=cv2.INTER_LINEAR)
+            ll_rgb = _scalar_to_rgb(mean_map, cmap_name=self.cmap_lowlevel)
+            ll_overlay = (0.55 * ll_rgb + 0.45 * img_np).astype(np.uint8)
+            panels.append(("Low-Level Mean Overlay", ll_overlay))
+        else:
+            panels.append(("Low-Level Overlay (None)", np.zeros_like(img_np)))
+
+        # Plot 2x4
+        fig, axes = mpl_plt.subplots(2, 4, figsize=(16, 8), dpi=self.dpi)
+        for ax, (title, arr) in zip(axes.flat, panels):
             ax.imshow(arr)
-            ax.set_title(title, fontsize=7)
+            ax.set_title(title, fontsize=10)
             ax.axis("off")
 
-        # Metrics subtitle
         if metrics:
-            metric_str = "  |  ".join(
-                f"{k}={v:.3f}" for k, v in metrics.items()
-                if isinstance(v, float) and not np.isnan(v)
-            )
-            fig.suptitle(f"{stem}\n{metric_str}", fontsize=7)
+            metric_str = " | ".join(f"{k}={v:.3f}" for k, v in metrics.items() if isinstance(v, float) and not np.isnan(v))
+            fig.suptitle(f"Master Overview: {stem}\n{metric_str}", fontsize=14, fontweight="bold")
         else:
-            fig.suptitle(stem, fontsize=8)
+            fig.suptitle(f"Master Overview: {stem}", fontsize=14, fontweight="bold")
 
         fig.tight_layout()
-        fig.savefig(self.out_dir / "grids" / f"{stem}_grid.png", bbox_inches="tight")
+        fig.savefig(self.out_dir / "master_grid" / f"{stem}_master.png", bbox_inches="tight")
         mpl_plt.close(fig)
 
     # ── Final Prediction ───────────────────────────────────────────────────────
