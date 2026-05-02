@@ -43,6 +43,8 @@ from .postprocess import get_postprocessor
 from .lowlevel import get_lowlevel_feature, fuse_features
 from .metrics import compute_all_metrics, print_metrics
 
+_GLOBAL_EMBEDDING_CACHE: Dict[str, Tensor] = {}
+
 
 class Pipeline:
     """
@@ -284,21 +286,76 @@ class Pipeline:
     def compute_global_mask_embedding(self, dataloader) -> Tensor:
         """
         Average all mask_embeddings in the dataloader to produce a global
-        prototype vector.
+        prototype vector. Also integrates low-level features of the GT mask if enabled.
         """
+        global _GLOBAL_EMBEDDING_CACHE
+        cache_key = str(self.config.lowlevel) if self.config.lowlevel else "none"
+        if cache_key in _GLOBAL_EMBEDDING_CACHE:
+            global_avg = _GLOBAL_EMBEDDING_CACHE[cache_key]
+            self.set_global_mask_embedding(global_avg)
+            return global_avg
+
         all_embs = []
         for batch in dataloader:
+            images = batch["image"]
+            masks = batch["mask"]
             embs = batch["mask_embedding"]  # (B, D)
-            # Only include non-zero embeddings (images with foreground)
-            for i in range(embs.shape[0]):
-                if embs[i].norm() > 1e-6:
-                    all_embs.append(embs[i].cpu())
+            patch_tokens = batch.get("patch_tokens", None)
+            
+            B = images.shape[0]
+            for i in range(B):
+                if embs[i].norm() <= 1e-6:
+                    continue
+                
+                dino_emb = embs[i].cpu()
+                
+                if self._lowlevel is not None:
+                    ll_kwargs = {}
+                    if hasattr(self._lowlevel, "extract") and patch_tokens is not None:
+                        import inspect
+                        sig = inspect.signature(self._lowlevel.extract)
+                        if "dino_features" in sig.parameters:
+                            pt = patch_tokens[i:i+1].to(self.device)
+                            img = images[i:i+1].to(self.device)
+                            pixel_feats = self._resolution.upsample(
+                                pt, original_image=img, target_size=self.config.target_size
+                            )[0]
+                            ll_kwargs["dino_features"] = pixel_feats
+                            
+                    ll_feats = self._lowlevel.extract(images[i].cpu(), **ll_kwargs) # (H, W, D_low)
+                    
+                    gt = masks[i, 0]
+                    if ll_feats.shape[:2] != gt.shape:
+                        gt_resized = F.interpolate(
+                            gt.unsqueeze(0).unsqueeze(0).float(),
+                            size=ll_feats.shape[:2],
+                            mode="nearest"
+                        )[0, 0]
+                    else:
+                        gt_resized = gt
+                        
+                    mask_px = gt_resized > 0
+                    if mask_px.any():
+                        ll_emb = ll_feats[mask_px].mean(dim=0).cpu()
+                        
+                        if self._ll_fusion_mode == "concat":
+                            fused_emb = torch.cat([dino_emb, ll_emb * self._ll_low_weight], dim=-1)
+                        elif self._ll_fusion_mode == "add":
+                            fused_emb = dino_emb + (ll_emb * self._ll_low_weight)
+                        else:
+                            fused_emb = dino_emb
+                        all_embs.append(fused_emb)
+                    else:
+                        all_embs.append(dino_emb)
+                else:
+                    all_embs.append(dino_emb)
 
         if not all_embs:
             warnings.warn("No valid mask embeddings found in dataloader.")
             return torch.zeros(768)
 
         global_avg = torch.stack(all_embs, dim=0).mean(dim=0)
+        _GLOBAL_EMBEDDING_CACHE[cache_key] = global_avg
         self.set_global_mask_embedding(global_avg)
         return global_avg
 
