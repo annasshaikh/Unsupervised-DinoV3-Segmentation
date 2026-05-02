@@ -222,6 +222,13 @@ class Pipeline:
                 mode="nearest",
             )[0, 0].long()
 
+        # If lowlevel features are enabled, the provided 768D mask_embedding is out of sync 
+        # with the fused pixel_feats. Recompute it dynamically using the fused features and GT mask.
+        if mask_embedding is not None and self._lowlevel is not None and _gt is not None:
+            mask_px = _gt > 0
+            if mask_px.any():
+                mask_embedding = pixel_feats[mask_px].mean(dim=0).cpu()
+
         pred_mask = self._assign(
             cluster_labels=cluster_labels,
             gt_mask=_gt,
